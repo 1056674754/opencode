@@ -32,8 +32,6 @@ const triggerClass =
 const showPopover = () => true
 
 export function HelpButton() {
-  if (import.meta.env.VITE_OPENCODE_CHANNEL !== "dev") return null
-
   const platform = usePlatform()
 
   return (
@@ -56,6 +54,7 @@ export function HelpButton() {
 // can remove this after the tabs rollout has been out for a while
 export function TabsInfoPopup() {
   const settings = useSettings()
+  const platform = usePlatform()
   const [drawerOpen, setDrawerOpen] = createSignal(false)
 
   return (
@@ -116,14 +115,16 @@ export function TabsInfoPopup() {
           <p class="min-h-0 min-w-0 flex-1 text-[13px] font-[530] leading-5 tracking-[-0.04px] tabular-nums text-v2-text-text-muted">
             July 14
           </p>
-          <DrawerClose
-            as={IconButtonV2}
-            type="button"
-            size="small"
-            variant="ghost-muted"
-            aria-label="Close"
-            icon={<IconV2 name="xmark-small" />}
-          />
+          <Show when={platform.platform !== "desktop" || platform.os !== "windows"}>
+            <DrawerClose
+              as={IconButtonV2}
+              type="button"
+              size="small"
+              variant="ghost-muted"
+              aria-label="Close"
+              icon={<IconV2 name="xmark-small" />}
+            />
+          </Show>
         </div>
         <div class="relative flex min-h-0 w-full flex-1 flex-col items-start gap-6 overflow-y-auto p-8">
           <p class="w-full shrink-0 self-stretch text-[21px] font-[610] leading-6 tracking-[-0.37px] tabular-nums text-v2-text-text-base">
