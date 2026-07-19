@@ -4,6 +4,12 @@
 - The default branch in this repo is `dev`.
 - Local `main` ref may not exist; use `dev` or `origin/dev` for diffs.
 
+## OpenChamber Embedded Packaging (MANDATORY)
+
+Before building or rebuilding an OpenCode binary intended for OpenChamber, changing its compiled channel/version behavior, replacing `~/.opencode/bin/opencode` for packaging, or participating in an OpenChamber package/release workflow, agents **MUST read `../openchamber-merge-v1.11.0/docs/EMBEDDED_OPENCODE_PACKAGING.md` completely**.
+
+If that sibling checkout or document is unavailable, stop and locate the canonical runbook instead of guessing. The OpenChamber embedded build is a custom merged binary, must preserve the documented `OPENCODE_CHANNEL=latest` shared-database behavior, and must be upgraded through rebuild/repackage/re-sign rather than an in-place binary update.
+
 ## Branch Names
 
 Use a short branch name of at most three words, separated by hyphens. Do not use slashes or type prefixes such as `feat/` or `fix/`.
