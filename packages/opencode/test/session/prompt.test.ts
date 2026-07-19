@@ -460,6 +460,55 @@ noLLMServer.instance(
   { config: cfg },
 )
 
+it.instance("loop stays busy and continues after an unknown finish", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const gate = yield* Deferred.make<void>()
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* user(chat.id, "hello")
+    yield* llm.push(reply().text("partial").unknown())
+    yield* llm.push(reply().text("complete").wait(deferredAsPromise(gate)).stop())
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* llm.wait(2)
+
+    expect((yield* status.get(chat.id)).type).toBe("busy")
+    succeedVoid(gate)
+
+    const result = yield* Fiber.join(fiber)
+    expect(yield* llm.calls).toBe(2)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("stop")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "complete")).toBe(true)
+    }
+    expect((yield* status.get(chat.id)).type).toBe("idle")
+  }),
+)
+
+it.instance("loop resumes when the last persisted assistant finish is unknown", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* seed(chat.id, { finish: "unknown" })
+    yield* llm.text("recovered")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.calls).toBe(1)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.finish).toBe("stop")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "recovered")).toBe(true)
+    }
+  }),
+)
+
 it.instance("loop exits without an LLM request for interrupted orphan tool calls", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

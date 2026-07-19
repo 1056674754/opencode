@@ -82,23 +82,32 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   // The test provider's SSE error item is interpreted by the SDK as an unknown
-  // finish, not a fatal provider/session error. Lock that distinction in so it
-  // is not accidentally used as the failure compatibility oracle.
+  // finish, not a fatal provider/session error. The Session keeps running and
+  // preserves the partial response before continuing with another provider turn.
   cliIt.concurrent(
-    "unknown stream finish preserves partial output and exits 0",
+    "unknown stream finish preserves partial output and continues",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
-        yield* llm.push(
-          reply().text("partial response").tool("bash", {
-            command: "printf tool",
-            description: "Print deterministic output",
-          }),
-        )
-        yield* llm.fail("upstream provider exploded mid-stream")
+        yield* llm.push(reply().text("partial response").streamError("upstream provider exploded mid-stream"))
         const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
         expect(result.exitCode).toBe(0)
-        expect(result.stdout).toBe("partial response\n")
+        expect(result.stdout).toBe("partial response\nok\n")
         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
+      }),
+    60_000,
+  )
+
+  cliIt.concurrent(
+    "retries an unknown stream finish that produced no output or usage",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.fail("empty provider stream")
+        yield* llm.text("recovered after retry")
+
+        const result = yield* opencode.run("retry an empty stream", { timeoutMs: 30_000 })
+
+        expect(result.exitCode).toBe(0)
+        expect(result.stdout).toBe("recovered after retry\n")
       }),
     60_000,
   )
@@ -213,16 +222,10 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.concurrent(
-    "--format json records partial output for an unknown stream finish",
+    "--format json records partial output and continuation after an unknown stream finish",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
-        yield* llm.push(
-          reply().text("partial json").tool("bash", {
-            command: "printf tool",
-            description: "Print deterministic output",
-          }),
-        )
-        yield* llm.fail("provider failed")
+        yield* llm.push(reply().text("partial json").streamError("provider failed"))
         const result = yield* opencode.run("fail after output", { format: "json" })
 
         const events = opencode.parseJsonEvents(result.stdout)
@@ -230,13 +233,15 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(events.map((event) => event.type)).toEqual([
           "step_start",
           "text",
-          "tool_use",
           "step_finish",
           "step_start",
+          "text",
           "step_finish",
         ])
         expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
-        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        expect(events[2]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        expect(events[4]?.part).toEqual(expect.objectContaining({ type: "text", text: "ok" }))
+        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
       }),
     60_000,
   )

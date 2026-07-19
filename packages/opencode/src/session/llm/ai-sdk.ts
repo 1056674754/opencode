@@ -1,7 +1,10 @@
 import { FinishReason, LLMEvent, ProviderMetadata, ToolResultValue } from "@opencode-ai/llm"
 import { Effect, Schema } from "effect"
 import { type streamText } from "ai"
+import { ProviderError } from "@/provider/error"
 import { errorMessage } from "@/util/error"
+
+// allow: SIZE_OK — this exhaustive AI SDK event adapter is one state machine; splitting it would weaken switch exhaustiveness.
 
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
@@ -15,6 +18,9 @@ export function adapterState() {
     currentReasoningID: undefined as string | undefined,
     toolNames: {} as Record<string, string>,
     copilotTotalNanoAiu: undefined as number | undefined,
+    content: false,
+    tool: 0,
+    aborted: false,
   }
 }
 
@@ -63,12 +69,28 @@ function usage(value: unknown) {
   return entries.length === 0 ? undefined : Object.fromEntries(entries)
 }
 
+function shouldRetryEmptyFinish(
+  state: ReturnType<typeof adapterState>,
+  reason: FinishReason,
+  tokens: ReturnType<typeof usage>,
+) {
+  return (
+    reason === "unknown" &&
+    !state.content &&
+    state.tool === 0 &&
+    !state.aborted &&
+    (tokens === undefined || Object.values(tokens).every((value) => value === 0))
+  )
+}
+
 function currentTextID(state: ReturnType<typeof adapterState>, id: string | undefined) {
+  state.content = true
   state.currentTextID = id ?? state.currentTextID ?? `text-${state.text++}`
   return state.currentTextID
 }
 
 function currentReasoningID(state: ReturnType<typeof adapterState>, id: string | undefined) {
+  state.content = true
   state.currentReasoningID = id ?? state.currentReasoningID ?? `reasoning-${state.reasoning++}`
   return state.currentReasoningID
 }
@@ -85,7 +107,12 @@ export function toLLMEvents(
       return Effect.succeed([LLMEvent.stepStart({ index: state.step })])
 
     case "finish-step":
-      return Effect.sync(() => {
+      return Effect.gen(function* () {
+        const reason = finishReason(event.finishReason)
+        const tokens = usage(event.usage)
+        if (shouldRetryEmptyFinish(state, reason, tokens)) {
+          return yield* Effect.fail(new ProviderError.ResponseStreamError("Provider stream ended without producing output"))
+        }
         const original = providerMetadata(event.providerMetadata)
         const metadata =
           state.copilotTotalNanoAiu === undefined
@@ -101,8 +128,8 @@ export function toLLMEvents(
         return [
           LLMEvent.stepFinish({
             index: state.step++,
-            reason: finishReason(event.finishReason),
-            usage: usage(event.usage),
+            reason,
+            usage: tokens,
             providerMetadata: metadata,
           }),
         ]
@@ -110,10 +137,12 @@ export function toLLMEvents(
 
     case "finish":
       return Effect.sync(() => {
+        const reason = finishReason(event.finishReason)
+        const tokens = usage(event.totalUsage)
         const events = [
           LLMEvent.finish({
-            reason: finishReason(event.finishReason),
-            usage: usage(event.totalUsage),
+            reason,
+            usage: tokens,
             providerMetadata: "providerMetadata" in event ? providerMetadata(event.providerMetadata) : undefined,
           }),
         ]
@@ -189,6 +218,7 @@ export function toLLMEvents(
 
     case "tool-input-start":
       return Effect.sync(() => {
+        state.tool++
         state.toolNames[event.id] = event.toolName
         return [
           LLMEvent.toolInputStart({
@@ -219,6 +249,7 @@ export function toLLMEvents(
 
     case "tool-call":
       return Effect.sync(() => {
+        state.tool++
         state.toolNames[event.toolCallId] = event.toolName
         return [
           LLMEvent.toolCall({
@@ -233,6 +264,7 @@ export function toLLMEvents(
 
     case "tool-result":
       return Effect.sync(() => {
+        state.tool++
         const name = state.toolNames[event.toolCallId] ?? "unknown"
         delete state.toolNames[event.toolCallId]
         return [
@@ -248,6 +280,7 @@ export function toLLMEvents(
 
     case "tool-error":
       return Effect.sync(() => {
+        state.tool++
         const name = state.toolNames[event.toolCallId] ?? ("toolName" in event ? event.toolName : "unknown")
         delete state.toolNames[event.toolCallId]
         return [
@@ -265,11 +298,21 @@ export function toLLMEvents(
       return Effect.fail(event.error)
 
     case "abort":
+      return Effect.sync(() => {
+        state.aborted = true
+        return []
+      })
+
     case "source":
     case "file":
+      return Effect.succeed([])
+
     case "tool-output-denied":
     case "tool-approval-request":
-      return Effect.succeed([])
+      return Effect.sync(() => {
+        state.tool++
+        return []
+      })
 
     case "raw":
       return Effect.sync(() => {

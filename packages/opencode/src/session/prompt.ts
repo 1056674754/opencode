@@ -99,6 +99,10 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+function isTerminalFinish(reason: SessionV1.Assistant["finish"]) {
+  return reason !== undefined && reason !== "tool-calls" && reason !== "unknown"
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -1109,8 +1113,8 @@ const layer = Layer.effect(
             ) ?? false
 
           if (
-            lastAssistant?.finish &&
-            !["tool-calls"].includes(lastAssistant.finish) &&
+            lastAssistant &&
+            isTerminalFinish(lastAssistant.finish) &&
             !hasToolCalls &&
             lastUser.id < lastAssistant.id
           ) {
@@ -1292,7 +1296,7 @@ const layer = Layer.effect(
               return "break" as const
             }
 
-            const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+            const finished = isTerminalFinish(handle.message.finish)
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
               // refusal) as an error. These turns may have produced no visible
