@@ -60,6 +60,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const summary = yield* SessionSummary.Service
     const events = yield* EventV2Bridge.Service
     const scope = yield* Scope.Scope
+    const promptAsyncReservations = new Set<SessionID>()
 
     const list = Effect.fn("SessionHttpApi.list")(function* (ctx: { query: typeof ListQuery.Type }) {
       const directory = ctx.query.directory ? yield* InstanceState.directory : undefined
@@ -80,6 +81,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const requireSession = Effect.fn("SessionHttpApi.requireSession")(function* (sessionID: SessionID) {
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
+    })
+
+    const reservePromptAsync = Effect.fn("SessionHttpApi.reservePromptAsync")(function* (sessionID: SessionID) {
+      yield* runState.assertNotBusy(sessionID)
+      if (promptAsyncReservations.has(sessionID)) {
+        return yield* Effect.fail(new Session.BusyError({ sessionID }))
+      }
+      promptAsyncReservations.add(sessionID)
+      return Effect.sync(() => {
+        promptAsyncReservations.delete(sessionID)
+      })
     })
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
@@ -231,6 +243,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* promptSvc.cancel(ctx.params.sessionID)
+      yield* events
+        .publish(Session.Event.Error, {
+          sessionID: ctx.params.sessionID,
+          error: new SessionV1.AbortedError({ message: "User aborted" }).toObject(),
+        })
+        .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
       return true
     })
 
@@ -313,7 +331,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
+      const releasePromptAsyncReservation = yield* SessionError.mapBusy(reservePromptAsync(ctx.params.sessionID))
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+        Effect.ensuring(releasePromptAsyncReservation),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })

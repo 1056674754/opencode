@@ -427,6 +427,58 @@ describe("session HttpApi", () => {
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
+  it.live("rejects prompt_async while the session already has active work", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.hang
+
+      const config = { ...testProviderConfig(llm.url), formatter: false, lsp: false }
+      const dir = yield* tmpdirScoped({ git: true, config })
+      const session = yield* createSession({ title: "prompt_async busy" }).pipe(provideInstanceEffect(dir))
+      const headers = { "x-opencode-directory": dir, "content-type": "application/json" }
+      const payload = {
+        agent: "build",
+        model: { providerID: "test", modelID: "test-model" },
+        parts: [{ type: "text", text: "start" }],
+      }
+
+      const first = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      })
+      expect(first.status).toBe(204)
+      yield* llm.wait(1)
+
+      const second = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ ...payload, parts: [{ type: "text", text: "overlap" }] }),
+      })
+      expect(second.status).toBe(409)
+      expect(yield* responseJson(second)).toMatchObject({
+        _tag: "SessionBusyError",
+        sessionID: session.id,
+      })
+
+      const messages = yield* Session.use.messages({ sessionID: session.id }).pipe(provideInstanceEffect(dir), Effect.orDie)
+      expect(messages.filter((message) => message.info.role === "user")).toHaveLength(1)
+
+      const aborted = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": dir },
+      })
+      expect(aborted.status).toBe(200)
+
+      const abortedMessages = yield* Session.use
+        .messages({ sessionID: session.id })
+        .pipe(provideInstanceEffect(dir), Effect.orDie)
+      expect(abortedMessages.some((message) =>
+        message.info.role === "assistant" && message.info.error?.name === "MessageAbortedError",
+      )).toBe(true)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
   it.instance(
     "returns v2 public request errors for cursor and workspace query failures",
     () =>
