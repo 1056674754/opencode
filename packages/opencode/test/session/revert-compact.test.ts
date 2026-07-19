@@ -635,4 +635,57 @@ describe("revert + compact workflow", () => {
       { git: true },
     ),
   )
+
+  it.live(
+    "unrevert preserves file changes from another session in the same worktree",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const snapshot = yield* Snapshot.Service
+
+          yield* write(path.join(dir, "a.txt"), "a0")
+          yield* write(path.join(dir, "b.txt"), "b0")
+
+          const turn = Effect.fn("test.turn.cross")(function* (sid: SessionID, file: string, next: string) {
+            const u = yield* user(sid)
+            yield* text(sid, u.id, `${file}:${next}`)
+            const a = yield* assistant(sid, u.id, dir)
+            const before = yield* snapshot.track()
+            if (!before) throw new Error("expected snapshot")
+            yield* write(path.join(dir, file), next)
+            const after = yield* snapshot.track()
+            if (!after) throw new Error("expected snapshot")
+            const patch = yield* snapshot.patch(before)
+            yield* session.updatePart({ id: PartID.ascending(), messageID: a.id, sessionID: sid, type: "step-start", snapshot: before })
+            yield* session.updatePart({ id: PartID.ascending(), messageID: a.id, sessionID: sid, type: "step-finish", reason: "stop", snapshot: after, cost: 0, tokens })
+            yield* session.updatePart({ id: PartID.ascending(), messageID: a.id, sessionID: sid, type: "patch", hash: patch.hash, files: patch.files })
+            return u.id
+          })
+
+          // Session A changes a.txt, then reverts. The revert snapshot S captures
+          // the worktree as (a1, b0) — b.txt has not been touched by anyone yet.
+          const infoA = yield* session.create({})
+          const sidA = infoA.id
+          const turnA = yield* turn(sidA, "a.txt", "a1")
+          yield* revert.revert({ sessionID: sidA, messageID: turnA })
+          expect(yield* read(path.join(dir, "a.txt"))).toBe("a0")
+
+          // Session B (same worktree) changes b.txt AFTER session A's snapshot.
+          const infoB = yield* session.create({})
+          const sidB = infoB.id
+          yield* turn(sidB, "b.txt", "b2")
+          expect(yield* read(path.join(dir, "b.txt"))).toBe("b2")
+
+          // Session A unreverts. Regression: snap.restore(S) previously did a
+          // full worktree checkout-index -a, clobbering b.txt back to b0 (its
+          // state in S). Scoped restore now only touches session A's files.
+          yield* revert.unrevert({ sessionID: sidA })
+          expect(yield* read(path.join(dir, "a.txt"))).toBe("a1")
+          expect(yield* read(path.join(dir, "b.txt"))).toBe("b2")
+        }),
+      { git: true },
+    ),
+  )
 })

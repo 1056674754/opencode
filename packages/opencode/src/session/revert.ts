@@ -43,10 +43,12 @@ const layer = Layer.effect(
 
       let rev: Session.Info["revert"]
       const patches: Snapshot.Patch[] = []
+      const sessionPatchFiles: string[] = []
       for (const msg of all) {
         if (msg.info.role === "user") lastUser = msg.info
         const remaining = []
         for (const part of msg.parts) {
+          if (part.type === "patch") sessionPatchFiles.push(...part.files)
           if (rev) {
             if (part.type === "patch") patches.push(part)
             continue
@@ -68,8 +70,19 @@ const layer = Layer.effect(
       if (!rev) return session
 
       rev.snapshot = session.revert?.snapshot ?? (yield* snap.track())
-      if (session.revert?.snapshot) yield* snap.restore(session.revert.snapshot)
-      yield* snap.revert(patches)
+      // Scope file restoration to the session's own files. The previous
+      // snap.restore() did a full worktree checkout (read-tree + checkout-index
+      // -a) which clobbered file changes made by other sessions sharing the
+      // same worktree. Using snap.revert() with the session's file set only
+      // touches files this session produced. (#32737: also skip the whole
+      // restore/revert path for no-op turns that produced no patches.)
+      if (patches.length > 0) {
+        const sessionFiles = Array.from(new Set(sessionPatchFiles))
+        if (session.revert?.snapshot && sessionFiles.length > 0) {
+          yield* snap.revert([{ hash: session.revert.snapshot, files: sessionFiles }])
+        }
+        yield* snap.revert(patches)
+      }
       if (rev.snapshot) rev.diff = yield* snap.diff(rev.snapshot)
       const range = all.filter((msg) => msg.info.id >= rev.messageID)
       const diffs = yield* summary.computeDiff({ messages: range })
@@ -92,7 +105,26 @@ const layer = Layer.effect(
       yield* state.assertNotBusy(input.sessionID)
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (!session.revert) return session
-      if (session.revert.snapshot) yield* snap.restore(session.revert.snapshot)
+      if (session.revert.snapshot) {
+        // Scope restore to the session's own files. A full worktree restore
+        // here would clobber changes made by other sessions sharing the same
+        // worktree. Files in earlier parts of the revert-point message are
+        // already at snapshot state (they were never reverted), so including
+        // them is a safe no-op.
+        const msgs = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+        const revertMessageID = session.revert.messageID
+        const files: string[] = []
+        for (const msg of msgs) {
+          if (msg.info.id < revertMessageID) continue
+          for (const part of msg.parts) {
+            if (part.type === "patch") files.push(...part.files)
+          }
+        }
+        const sessionFiles = Array.from(new Set(files))
+        if (sessionFiles.length > 0) {
+          yield* snap.revert([{ hash: session.revert.snapshot, files: sessionFiles }])
+        }
+      }
       yield* sessions.clearRevert(input.sessionID)
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
     })
