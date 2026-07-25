@@ -30,6 +30,10 @@ import "./styles.css"
 import { Splash } from "@opencode-ai/ui/logo"
 import { useTheme } from "@opencode-ai/ui/theme/context"
 
+const [windowFullscreen, setWindowFullscreen] = createSignal(false)
+window.api.onWindowFullscreenChanged(setWindowFullscreen)
+void window.api.getWindowFullscreen().then(setWindowFullscreen)
+
 const root = document.getElementById("root")
 if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
   throw new Error(t("error.dev.rootNotFound"))
@@ -293,6 +297,8 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
     parseMarkdown: (markdown: string) => window.api.parseMarkdownCommand(markdown),
 
     webviewZoom,
+
+    windowFullscreen,
 
     getPinchZoomEnabled: () => window.api.getPinchZoomEnabled(),
 
