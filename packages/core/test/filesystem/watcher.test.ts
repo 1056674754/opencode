@@ -2,7 +2,7 @@ import { $ } from "bun"
 import { describe, expect } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { ConfigProvider, Deferred, Duration, Effect, Fiber, Layer, Option, Stream } from "effect"
+import { ConfigProvider, Deferred, Duration, Effect, Fiber, Layer, Option, Queue, Stream } from "effect"
 import { Config } from "@opencode-ai/core/config"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -144,6 +144,92 @@ function ready(directory: string) {
 }
 
 describeWatcher("Watcher", () => {
+  it.live("subscribes directories outside the project root", () =>
+    withTmp(() =>
+      Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      ).pipe(
+        Effect.flatMap((external) =>
+          Effect.gen(function* () {
+            const watcher = yield* Watcher.Service
+            const afs = yield* FSUtil.Service
+            const file = path.join(external.path, "external.txt")
+            yield* watcher.subscribe(external.path)
+
+            expect(
+              yield* nextUpdate(
+                (event) => event.file === file && event.event === "add",
+                afs.writeFileString(file, "external"),
+              ),
+            ).toEqual({ file, event: "add" })
+          }),
+        ),
+      ),
+    ),
+  )
+
+  it.live("stops publishing external directory events after unsubscribe", () =>
+    withTmp(() =>
+      Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      ).pipe(
+        Effect.flatMap((external) =>
+          Effect.gen(function* () {
+            const watcher = yield* Watcher.Service
+            const afs = yield* FSUtil.Service
+            const readyFile = path.join(external.path, "ready.txt")
+            const after = path.join(external.path, "after.txt")
+            const unsubscribe = yield* watcher.subscribe(external.path)
+            yield* nextUpdate(
+              (event) => event.file === readyFile && event.event === "add",
+              afs.writeFileString(readyFile, "ready"),
+            )
+
+            yield* unsubscribe
+            yield* noUpdate((event) => event.file === after, afs.writeFileString(after, "after"))
+          }),
+        ),
+      ),
+    ),
+  )
+
+  it.live("subscribes the same directory once", () =>
+    withTmp(() =>
+      Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      ).pipe(
+        Effect.flatMap((external) =>
+          Effect.gen(function* () {
+            const watcher = yield* Watcher.Service
+            const events = yield* EventV2.Service
+            const afs = yield* FSUtil.Service
+            const file = path.join(external.path, "once.txt")
+            const queue = yield* Queue.unbounded<WatcherEvent>()
+            yield* events.subscribe(Watcher.Event.Updated).pipe(
+              Stream.runForEach((event) => {
+                if (event.data.file !== file || event.data.event !== "add") return Effect.void
+                return Queue.offer(queue, event.data).pipe(Effect.asVoid)
+              }),
+              Effect.forkScoped,
+            )
+            yield* Effect.yieldNow
+            yield* watcher.subscribe(external.path)
+            yield* watcher.subscribe(external.path)
+
+            yield* afs.writeFileString(file, "once")
+            expect(yield* Queue.take(queue).pipe(Effect.timeoutOption("5 seconds"))).toEqual(
+              Option.some({ file, event: "add" }),
+            )
+            expect(yield* Queue.take(queue).pipe(Effect.timeoutOption("500 millis"))).toEqual(Option.none())
+          }),
+        ),
+      ),
+    ),
+  )
+
   it.live("publishes root create, update, and delete events", () =>
     withTmp(
       (directory) =>

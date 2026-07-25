@@ -1,10 +1,9 @@
 export * as Watcher from "./watcher"
 
-// @ts-ignore
 import { createWrapper } from "@parcel/watcher/wrapper"
 import type ParcelWatcher from "@parcel/watcher"
 import { makeLocationNode } from "../effect/app-node"
-import { Cause, Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer, Scope } from "effect"
 import { FileSystemWatcher } from "@opencode-ai/schema/filesystem-watcher"
 import path from "path"
 import { Config } from "../config"
@@ -29,16 +28,17 @@ const watcher = lazy((): typeof import("@parcel/watcher") | undefined => {
     const binding = require(
       `@parcel/watcher-${process.platform}-${process.arch}${process.platform === "linux" ? `-${libc || "glibc"}` : ""}`,
     )
-    return createWrapper(binding) as typeof import("@parcel/watcher")
+    return createWrapper(binding)
   } catch {
-    return
+    return undefined
   }
 })
 
-function getBackend() {
+function getBackend(): ParcelWatcher.BackendType | undefined {
   if (process.platform === "win32") return "windows"
   if (process.platform === "darwin") return "fs-events"
   if (process.platform === "linux") return "inotify"
+  return undefined
 }
 
 function protecteds(dir: string) {
@@ -50,14 +50,23 @@ function protecteds(dir: string) {
 
 export const hasNativeBinding = () => !!watcher()
 
-export interface Interface {}
+export interface Interface {
+  readonly subscribe: (
+    directory: string,
+    ignore?: string[],
+  ) => Effect.Effect<Effect.Effect<void, never, never>, never, Scope.Scope>
+}
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/FileWatcher") {}
+
+const noop = Service.of({
+  subscribe: () => Effect.succeed(Effect.void),
+})
 
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    if (yield* Flag.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER) return Service.of({})
+    if (yield* Flag.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER) return noop
 
     const backend = getBackend()
     const location = yield* Location.Service
@@ -66,11 +75,11 @@ const layer = Layer.effect(
         directory: location.directory,
         platform: process.platform,
       })
-      return Service.of({})
+      return noop
     }
 
     const w = watcher()
-    if (!w) return Service.of({})
+    if (!w) return noop
 
     yield* Effect.logInfo("watcher backend", { directory: location.directory, platform: process.platform, backend })
     const events = yield* EventV2.Service
@@ -78,9 +87,18 @@ const layer = Layer.effect(
     const git = yield* Git.Service
     const context = yield* Effect.context()
     const runFork = Effect.runForkWith(context)
-    const subscriptions: ParcelWatcher.AsyncSubscription[] = []
+    const subscriptions = new Map<
+      string,
+      { pending: Promise<ParcelWatcher.AsyncSubscription>; references: number }
+    >()
     yield* Effect.addFinalizer(() =>
-      Effect.promise(() => Promise.allSettled(subscriptions.map((subscription) => subscription.unsubscribe()))),
+      Effect.promise(() =>
+        Promise.allSettled(
+          Array.from(subscriptions.values(), (active) =>
+            active.pending.then((subscription) => subscription.unsubscribe()),
+          ),
+        ).then(() => subscriptions.clear()),
+      ),
     )
 
     const callback: ParcelWatcher.SubscribeCallback = (_error, updates) => {
@@ -91,17 +109,50 @@ const layer = Layer.effect(
       }
     }
 
-    const subscribe = (directory: string, ignore: string[]) => {
-      const pending = w.subscribe(directory, callback, { ignore, backend })
-      return Effect.promise(() => pending).pipe(
-        Effect.tap((subscription) => Effect.sync(() => subscriptions.push(subscription))),
-        Effect.timeout(SUBSCRIBE_TIMEOUT_MS),
-        Effect.catchCause((cause) => {
-          pending.then((subscription) => subscription.unsubscribe()).catch(() => {})
-          return Effect.logError("failed to subscribe", { directory, cause: Cause.pretty(cause) })
-        }),
-      )
+    const unsubscribe = (
+      directory: string,
+      active: { pending: Promise<ParcelWatcher.AsyncSubscription>; references: number },
+    ) => {
+      let subscribed = true
+      return Effect.suspend(() => {
+        if (!subscribed) return Effect.void
+        subscribed = false
+        if (subscriptions.get(directory) !== active) return Effect.void
+        active.references--
+        if (active.references > 0) return Effect.void
+        subscriptions.delete(directory)
+        return Effect.promise(() =>
+          active.pending.then((subscription) => subscription.unsubscribe()).catch(() => {}),
+        )
+      })
     }
+
+    const acquire = (directory: string, ignore: string[]) =>
+      Effect.suspend(() => {
+        const active = subscriptions.get(directory)
+        if (active) {
+          active.references++
+          return Effect.succeed(unsubscribe(directory, active))
+        }
+
+        const pending = w.subscribe(directory, callback, { ignore, backend })
+        const created = { pending, references: 1 }
+        subscriptions.set(directory, created)
+        return Effect.promise(() => pending).pipe(
+          Effect.timeout(SUBSCRIBE_TIMEOUT_MS),
+          Effect.as(unsubscribe(directory, created)),
+          Effect.catchCause((cause) => {
+            if (subscriptions.get(directory) === created) subscriptions.delete(directory)
+            pending.then((subscription) => subscription.unsubscribe()).catch(() => {})
+            return Effect.logError("failed to subscribe", { directory, cause: Cause.pretty(cause) }).pipe(
+              Effect.as(Effect.void),
+            )
+          }),
+        )
+      })
+
+    const subscribe: Interface["subscribe"] = (directory, ignore = []) =>
+      Effect.acquireRelease(acquire(directory, ignore), (cleanup) => cleanup)
 
     const config = (yield* (yield* Config.Service).entries())
       .filter((entry): entry is Config.Document => entry.type === "document")
@@ -123,11 +174,11 @@ const layer = Layer.effect(
       }
     }
 
-    return Service.of({})
+    return Service.of({ subscribe })
   }).pipe(
     Effect.catchCause((cause) => {
       return Effect.logError("failed to init watcher service", { cause: Cause.pretty(cause) }).pipe(
-        Effect.as(Service.of({})),
+        Effect.as(noop),
       )
     }),
   ),
