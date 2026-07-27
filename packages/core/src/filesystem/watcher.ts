@@ -1,3 +1,5 @@
+/// <reference path="./parcel-watcher-wrapper.d.ts" />
+
 export * as Watcher from "./watcher"
 
 import { createWrapper } from "@parcel/watcher/wrapper"
