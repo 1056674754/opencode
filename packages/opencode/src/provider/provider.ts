@@ -18,7 +18,7 @@ import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Effect, Layer, Context, Schema, Types } from "effect"
+import { Effect, Layer, Context, Schema, Semaphore, Types } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectPromise } from "@/effect/promise"
@@ -1145,26 +1145,56 @@ export class NoModelsError extends Schema.TaggedErrorClass<NoModelsError>()("Pro
 export type DefaultModelError = ModelNotFoundError | NoProvidersError | NoModelsError
 export type Error = ModelNotFoundError | InitError | NoProvidersError | NoModelsError
 
+export interface ProviderSnapshot {
+  readonly models: Map<string, LanguageModelV3>
+  readonly providers: Record<ProviderV2.ID, Info>
+  readonly catalog: Record<ProviderV2.ID, Info>
+  readonly sdk: Map<string, BundledSDK>
+  readonly modelLoaders: Record<string, CustomModelLoader>
+  readonly varsLoaders: Record<string, CustomVarsLoader>
+}
+
 export interface Interface {
-  readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
-  readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
-  readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
-  readonly getLanguage: (model: Model) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
+  readonly list: (options?: { readonly snapshot?: ProviderSnapshot }) => Effect.Effect<Record<ProviderV2.ID, Info>>
+  readonly getProvider: (
+    providerID: ProviderV2.ID,
+    options?: { readonly snapshot?: ProviderSnapshot },
+  ) => Effect.Effect<Info>
+  readonly getModel: (
+    providerID: ProviderV2.ID,
+    modelID: ModelV2.ID,
+    options?: { readonly snapshot?: ProviderSnapshot },
+  ) => Effect.Effect<Model, ModelNotFoundError>
+  readonly getLanguage: (
+    model: Model,
+    options?: { readonly snapshot?: ProviderSnapshot },
+  ) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
   readonly closest: (
     providerID: ProviderV2.ID,
     query: string[],
   ) => Effect.Effect<{ providerID: ProviderV2.ID; modelID: string } | undefined>
-  readonly getSmallModel: (providerID: ProviderV2.ID) => Effect.Effect<Model | undefined>
-  readonly defaultModel: () => Effect.Effect<{ providerID: ProviderV2.ID; modelID: ModelV2.ID }, DefaultModelError>
+  readonly getSmallModel: (
+    providerID: ProviderV2.ID,
+    options?: { readonly snapshot?: ProviderSnapshot },
+  ) => Effect.Effect<Model | undefined>
+  readonly getSmallModelChain: (
+    providerID: ProviderV2.ID,
+    options?: { readonly snapshot?: ProviderSnapshot },
+  ) => Effect.Effect<Model[]>
+  readonly defaultModel: (
+    options?: { readonly snapshot?: ProviderSnapshot },
+  ) => Effect.Effect<{ providerID: ProviderV2.ID; modelID: ModelV2.ID }, DefaultModelError>
+  readonly forSession: (sessionID?: string) => Effect.Effect<ProviderSnapshot>
+  readonly pinSession: (sessionID: string) => Effect.Effect<ProviderSnapshot>
+  readonly unpinSession: (sessionID: string) => Effect.Effect<void>
+  readonly cleanupOrphanedSnapshots: () => Effect.Effect<number>
+  readonly reloadProviders: (config?: ConfigV1.Info) => Effect.Effect<ProviderSnapshot, NoProvidersError>
 }
 
-interface State {
-  models: Map<string, LanguageModelV3>
-  providers: Record<ProviderV2.ID, Info>
-  catalog: Record<ProviderV2.ID, Info>
-  sdk: Map<string, BundledSDK>
-  modelLoaders: Record<string, CustomModelLoader>
-  varsLoaders: Record<string, CustomVarsLoader>
+interface SnapshotState {
+  currentSnapshot: ProviderSnapshot
+  sessionSnapshots: Map<string, ProviderSnapshot>
+  revision: number
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1335,11 +1365,9 @@ const layer = Layer.effect(
     const modelsDevSvc = yield* ModelsDev.Service
     const runtimeFlags = yield* RuntimeFlags.Service
 
-    const state = yield* InstanceState.make<State>(() =>
-      Effect.gen(function* () {
-        const bridge = yield* EffectBridge.make()
-        const cfg = yield* config.get()
-        const modelsDev = yield* modelsDevSvc.get()
+    const buildSnapshot = Effect.fnUntraced(function* (cfg: ConfigV1.Info) {
+      const bridge = yield* EffectBridge.make()
+      const modelsDev = yield* modelsDevSvc.get()
         const catalog = mapValues(modelsDev, fromModelsDevProvider)
         const database = mapValues(catalog, toPublicInfo)
 
@@ -1357,7 +1385,7 @@ const layer = Layer.effect(
         } = {}
         const dep = {
           auth: (id: string) => auth.get(id).pipe(Effect.orDie),
-          config: () => config.get(),
+          config: () => Effect.succeed(cfg),
           env: () => env.all(),
           get: (key: string) => env.get(key),
         }
@@ -1660,14 +1688,36 @@ const layer = Layer.effect(
           modelLoaders,
           varsLoaders,
         }
+      },
+    )
+
+    const snapshotState = yield* InstanceState.make<SnapshotState>(() =>
+      Effect.gen(function* () {
+        const cfg = yield* config.get()
+        return {
+          currentSnapshot: yield* buildSnapshot(cfg),
+          sessionSnapshots: new Map<string, ProviderSnapshot>(),
+          revision: 0,
+        }
       }),
     )
 
-    const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
+    function resolveSnapshot(
+      s: SnapshotState,
+      options?: { readonly snapshot?: ProviderSnapshot },
+    ): ProviderSnapshot {
+      return options?.snapshot ?? s.currentSnapshot
+    }
 
-    async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
+    const reloadSemaphore = Semaphore.makeUnsafe(1)
+
+    const list = Effect.fn("Provider.list")((options?: { readonly snapshot?: ProviderSnapshot }) =>
+      InstanceState.use(snapshotState, (s) => resolveSnapshot(s, options).providers),
+    )
+
+    async function resolveSDK(model: Model, snapshot: ProviderSnapshot, envs: Record<string, string | undefined>) {
       try {
-        const provider = s.providers[model.providerID]
+        const provider = snapshot.providers[model.providerID]
         const options = { ...provider.options }
 
         if (
@@ -1695,7 +1745,7 @@ const layer = Layer.effect(
             typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
           if (!url) return
 
-          const loader = s.varsLoaders[model.providerID]
+          const loader = snapshot.varsLoaders[model.providerID]
           if (loader) {
             const vars = loader(options)
             for (const [key, value] of Object.entries(vars)) {
@@ -1726,7 +1776,7 @@ const layer = Layer.effect(
             options,
           }),
         )
-        const existing = s.sdk.get(key)
+        const existing = snapshot.sdk.get(key)
         if (existing) return existing
 
         const customFetch = options["fetch"]
@@ -1769,7 +1819,7 @@ const layer = Layer.effect(
             name: model.providerID,
             ...options,
           })
-          s.sdk.set(key, loaded)
+          snapshot.sdk.set(key, loaded)
           return loaded as SDK
         }
 
@@ -1792,75 +1842,89 @@ const layer = Layer.effect(
           name: model.providerID,
           ...options,
         })
-        s.sdk.set(key, loaded)
+        snapshot.sdk.set(key, loaded)
         return loaded as SDK
       } catch (e) {
         throw new InitError({ providerID: model.providerID, cause: e })
       }
     }
 
-    const getProvider = Effect.fn("Provider.getProvider")((providerID: ProviderV2.ID) =>
-      InstanceState.use(state, (s) => s.providers[providerID]),
+    const getProvider = Effect.fn("Provider.getProvider")(
+      (providerID: ProviderV2.ID, options?: { readonly snapshot?: ProviderSnapshot }) =>
+        InstanceState.use(snapshotState, (s) => resolveSnapshot(s, options).providers[providerID]),
     )
 
-    const getModel = Effect.fn("Provider.getModel")(function* (providerID: ProviderV2.ID, modelID: ModelV2.ID) {
-      const s = yield* InstanceState.get(state)
-      const provider = s.providers[providerID]
-      if (!provider) {
-        const catalogProvider = s.catalog[providerID]
-        const suggestions = catalogProvider
-          ? modelSuggestions(catalogProvider, modelID, runtimeFlags.enableExperimentalModels)
-          : fuzzysort
-              .go(providerID, Object.keys({ ...s.catalog, ...s.providers }), { limit: 3, threshold: -10000 })
-              .map((m) => m.target)
-        return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
-      }
+    const getModel = Effect.fn("Provider.getModel")(
+      function* (
+        providerID: ProviderV2.ID,
+        modelID: ModelV2.ID,
+        options?: { readonly snapshot?: ProviderSnapshot },
+      ) {
+        const s = yield* InstanceState.get(snapshotState)
+        const snapshot = resolveSnapshot(s, options)
+        const provider = snapshot.providers[providerID]
+        if (!provider) {
+          const catalogProvider = snapshot.catalog[providerID]
+          const suggestions = catalogProvider
+            ? modelSuggestions(catalogProvider, modelID, runtimeFlags.enableExperimentalModels)
+            : fuzzysort
+                .go(providerID, Object.keys({ ...snapshot.catalog, ...snapshot.providers }), {
+                  limit: 3,
+                  threshold: -10000,
+                })
+                .map((m) => m.target)
+          return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
+        }
 
-      const info = provider.models[modelID]
-      if (!info) {
-        const current = modelSuggestions(provider, modelID, runtimeFlags.enableExperimentalModels)
-        const suggestions = current.length
-          ? current
-          : modelSuggestions(s.catalog[providerID], modelID, runtimeFlags.enableExperimentalModels)
-        return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
-      }
-      return info
-    })
+        const info = provider.models[modelID]
+        if (!info) {
+          const current = modelSuggestions(provider, modelID, runtimeFlags.enableExperimentalModels)
+          const suggestions = current.length
+            ? current
+            : modelSuggestions(snapshot.catalog[providerID], modelID, runtimeFlags.enableExperimentalModels)
+          return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
+        }
+        return info
+      },
+    )
 
-    const getLanguage = Effect.fn("Provider.getLanguage")(function* (model: Model) {
-      const s = yield* InstanceState.get(state)
-      const envs = yield* env.all()
-      const key = `${model.providerID}/${model.id}`
-      if (s.models.has(key)) return s.models.get(key)!
+    const getLanguage = Effect.fn("Provider.getLanguage")(
+      function* (model: Model, options?: { readonly snapshot?: ProviderSnapshot }) {
+        const s = yield* InstanceState.get(snapshotState)
+        const snapshot = resolveSnapshot(s, options)
+        const envs = yield* env.all()
+        const key = `${model.providerID}/${model.id}`
+        if (snapshot.models.has(key)) return snapshot.models.get(key)!
 
-      const provider = s.providers[model.providerID]
-      return yield* EffectPromise.refineRejection(
-        async () => {
-          const sdk = await resolveSDK(model, s, envs)
-          const language = s.modelLoaders[model.providerID]
-            ? await s.modelLoaders[model.providerID](
-                sdk,
-                model.api.id,
-                {
-                  ...provider.options,
-                  ...model.options,
-                },
-                model,
-              )
-            : sdk.languageModel(model.api.id)
-          s.models.set(key, language)
-          return language
-        },
-        (cause) =>
-          cause instanceof NoSuchModelError
-            ? new ModelNotFoundError({ modelID: model.id, providerID: model.providerID, cause })
-            : undefined,
-      )
-    })
+        const provider = snapshot.providers[model.providerID]
+        return yield* EffectPromise.refineRejection(
+          async () => {
+            const sdk = await resolveSDK(model, snapshot, envs)
+            const language = snapshot.modelLoaders[model.providerID]
+              ? await snapshot.modelLoaders[model.providerID](
+                  sdk,
+                  model.api.id,
+                  {
+                    ...provider.options,
+                    ...model.options,
+                  },
+                  model,
+                )
+              : sdk.languageModel(model.api.id)
+            snapshot.models.set(key, language)
+            return language
+          },
+          (cause) =>
+            cause instanceof NoSuchModelError
+              ? new ModelNotFoundError({ modelID: model.id, providerID: model.providerID, cause })
+              : undefined,
+        )
+      },
+    )
 
     const closest = Effect.fn("Provider.closest")(function* (providerID: ProviderV2.ID, query: string[]) {
-      const s = yield* InstanceState.get(state)
-      const provider = s.providers[providerID]
+      const s = yield* InstanceState.get(snapshotState)
+      const provider = s.currentSnapshot.providers[providerID]
       if (!provider) return undefined
       for (const item of query) {
         for (const modelID of Object.keys(provider.models)) {
@@ -1870,111 +1934,201 @@ const layer = Layer.effect(
       return undefined
     })
 
-    const getSmallModel = Effect.fn("Provider.getSmallModel")(function* (providerID: ProviderV2.ID) {
-      const cfg = yield* config.get()
+    const getSmallModel = Effect.fn("Provider.getSmallModel")(
+      function* (providerID: ProviderV2.ID, options?: { readonly snapshot?: ProviderSnapshot }) {
+        const cfg = yield* config.get()
 
-      if (cfg.small_model) {
-        const parsed = parseModel(cfg.small_model)
-        return yield* getModel(parsed.providerID, parsed.modelID).pipe(
-          Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)),
+        if (cfg.small_model) {
+          const parsed = parseModel(cfg.small_model)
+          return yield* getModel(parsed.providerID, parsed.modelID, options).pipe(
+            Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)),
+          )
+        }
+
+        const s = yield* InstanceState.get(snapshotState)
+        const snapshot = resolveSnapshot(s, options)
+        const provider = snapshot.providers[providerID]
+        if (!provider) return undefined
+
+        const experimental = yield* plugin.trigger<"experimental.provider.small_model">(
+          "experimental.provider.small_model",
+          { provider: toPublicInfo(provider) },
+          { model: undefined },
         )
-      }
-
-      const s = yield* InstanceState.get(state)
-      const provider = s.providers[providerID]
-      if (!provider) return undefined
-
-      const experimental = yield* plugin.trigger<"experimental.provider.small_model">(
-        "experimental.provider.small_model",
-        { provider: toPublicInfo(provider) },
-        { model: undefined },
-      )
-      if (experimental.model) {
-        return {
-          ...experimental.model,
-          id: ModelV2.ID.make(experimental.model.id),
-          providerID: ProviderV2.ID.make(experimental.model.providerID),
-        }
-      }
-
-      // TODO: Remove these provider-specific assumptions once model syncing reliably reports available deployments.
-      if (providerID === ProviderV2.ID.azure || providerID === ProviderV2.ID.make("azure-cognitive-services")) {
-        return undefined
-      }
-
-      const priority = providerID.startsWith("opencode")
-        ? ["gpt-nano"]
-        : providerID.startsWith("github-copilot")
-          ? ["gpt-mini", ...smallModelFamilyPriority]
-          : smallModelFamilyPriority
-      const models = sortBy(
-        Object.values(provider.models),
-        [(model) => model.release_date, "desc"],
-        [(model) => model.id, "desc"],
-      )
-      for (const family of priority) {
-        const candidates = models.filter((model) => model.family === family)
-        if (providerID === ProviderV2.ID.amazonBedrock) {
-          const crossRegionPrefixes = ["global.", "us.", "eu."]
-
-          const globalMatch = candidates.find((model) => model.id.startsWith("global."))
-          if (globalMatch) return globalMatch
-
-          const region = provider.options?.region
-          if (region) {
-            const regionPrefix = region.split("-")[0]
-            if (regionPrefix === "us" || regionPrefix === "eu") {
-              const regionalMatch = candidates.find((model) => model.id.startsWith(`${regionPrefix}.`))
-              if (regionalMatch) return regionalMatch
-            }
+        if (experimental.model) {
+          return {
+            ...experimental.model,
+            id: ModelV2.ID.make(experimental.model.id),
+            providerID: ProviderV2.ID.make(experimental.model.providerID),
           }
-
-          const unprefixed = candidates.find((model) => !crossRegionPrefixes.some((p) => model.id.startsWith(p)))
-          if (unprefixed) return unprefixed
-          continue
         }
-        if (candidates[0]) return candidates[0]
-      }
 
-      return undefined
+        // TODO: Remove these provider-specific assumptions once model syncing reliably reports available deployments.
+        if (providerID === ProviderV2.ID.azure || providerID === ProviderV2.ID.make("azure-cognitive-services")) {
+          return undefined
+        }
+
+        const priority = providerID.startsWith("opencode")
+          ? ["gpt-nano"]
+          : providerID.startsWith("github-copilot")
+            ? ["gpt-mini", ...smallModelFamilyPriority]
+            : smallModelFamilyPriority
+        const models = sortBy(
+          Object.values(provider.models),
+          [(model) => model.release_date, "desc"],
+          [(model) => model.id, "desc"],
+        )
+        for (const family of priority) {
+          const candidates = models.filter((model) => model.family === family)
+          if (providerID === ProviderV2.ID.amazonBedrock) {
+            const crossRegionPrefixes = ["global.", "us.", "eu."]
+
+            const globalMatch = candidates.find((model) => model.id.startsWith("global."))
+            if (globalMatch) return globalMatch
+
+            const region = provider.options?.region
+            if (region) {
+              const regionPrefix = region.split("-")[0]
+              if (regionPrefix === "us" || regionPrefix === "eu") {
+                const regionalMatch = candidates.find((model) => model.id.startsWith(`${regionPrefix}.`))
+                if (regionalMatch) return regionalMatch
+              }
+            }
+
+            const unprefixed = candidates.find((model) => !crossRegionPrefixes.some((p) => model.id.startsWith(p)))
+            if (unprefixed) return unprefixed
+            continue
+          }
+          if (candidates[0]) return candidates[0]
+        }
+
+        return undefined
+      },
+    )
+
+    const getSmallModelChain = Effect.fn("Provider.getSmallModelChain")(
+      function* (providerID: ProviderV2.ID, options?: { readonly snapshot?: ProviderSnapshot }) {
+        const candidates: Model[] = []
+
+        const primary = yield* getSmallModel(providerID, options)
+        if (primary) candidates.push(primary)
+
+        const cfg = yield* config.get()
+        if (cfg.small_model_fallback?.length) {
+          for (const entry of cfg.small_model_fallback) {
+            const parsed = parseModel(entry)
+            const model = yield* getModel(parsed.providerID, parsed.modelID, options).pipe(
+              Effect.catchTag("ProviderModelNotFoundError", () =>
+                Effect.logWarning("small_model_fallback entry not resolvable, skipping", { model: entry }).pipe(
+                  Effect.as(undefined),
+                ),
+              ),
+            )
+            if (model) candidates.push(model)
+          }
+        }
+
+        return candidates
+      },
+    )
+
+    const defaultModel = Effect.fn("Provider.defaultModel")(
+      function* (options?: { readonly snapshot?: ProviderSnapshot }) {
+        const cfg = yield* config.get()
+        if (cfg.model) return parseModel(cfg.model)
+
+        const s = yield* InstanceState.get(snapshotState)
+        const snapshot = resolveSnapshot(s, options)
+        const recent = yield* fs.readJson(path.join(Global.Path.state, "model.json")).pipe(
+          Effect.map((x): { providerID: ProviderV2.ID; modelID: ModelV2.ID }[] => {
+            if (!isRecord(x) || !Array.isArray(x.recent)) return []
+            return x.recent.flatMap((item) => {
+              if (!isRecord(item)) return []
+              if (typeof item.providerID !== "string") return []
+              if (typeof item.modelID !== "string") return []
+              return [{ providerID: ProviderV2.ID.make(item.providerID), modelID: ModelV2.ID.make(item.modelID) }]
+            })
+          }),
+          Effect.catch(() => Effect.succeed([] as { providerID: ProviderV2.ID; modelID: ModelV2.ID }[])),
+        )
+        for (const entry of recent) {
+          const provider = snapshot.providers[entry.providerID]
+          if (!provider) continue
+          if (!provider.models[entry.modelID]) continue
+          return { providerID: entry.providerID, modelID: entry.modelID }
+        }
+
+        const configured = Object.keys(cfg.provider ?? {})
+        const provider = Object.values(snapshot.providers).find(
+          (p) => configured.length === 0 || configured.includes(p.id),
+        )
+        if (!provider) return yield* new NoProvidersError()
+        const [model] = sort(Object.values(provider.models))
+        if (!model) return yield* new NoModelsError({ providerID: provider.id })
+        return {
+          providerID: provider.id,
+          modelID: model.id,
+        }
+      },
+    )
+
+    const forSession = Effect.fn("Provider.forSession")(function* (sessionID?: string) {
+      const s = yield* InstanceState.get(snapshotState)
+      if (sessionID) {
+        const pinned = s.sessionSnapshots.get(sessionID)
+        if (pinned) return pinned
+        s.sessionSnapshots.set(sessionID, s.currentSnapshot)
+        return s.currentSnapshot
+      }
+      return s.currentSnapshot
     })
 
-    const defaultModel = Effect.fn("Provider.defaultModel")(function* () {
-      const cfg = yield* config.get()
-      if (cfg.model) return parseModel(cfg.model)
+    const pinSession = Effect.fn("Provider.pinSession")(function* (sessionID: string) {
+      const s = yield* InstanceState.get(snapshotState)
+      s.sessionSnapshots.set(sessionID, s.currentSnapshot)
+      return s.currentSnapshot
+    })
 
-      const s = yield* InstanceState.get(state)
-      const recent = yield* fs.readJson(path.join(Global.Path.state, "model.json")).pipe(
-        Effect.map((x): { providerID: ProviderV2.ID; modelID: ModelV2.ID }[] => {
-          if (!isRecord(x) || !Array.isArray(x.recent)) return []
-          return x.recent.flatMap((item) => {
-            if (!isRecord(item)) return []
-            if (typeof item.providerID !== "string") return []
-            if (typeof item.modelID !== "string") return []
-            return [{ providerID: ProviderV2.ID.make(item.providerID), modelID: ModelV2.ID.make(item.modelID) }]
-          })
+    const unpinSession = Effect.fn("Provider.unpinSession")(function* (sessionID: string) {
+      const s = yield* InstanceState.get(snapshotState)
+      s.sessionSnapshots.delete(sessionID)
+    })
+
+    const cleanupOrphanedSnapshots = Effect.fn("Provider.cleanupOrphanedSnapshots")(function* () {
+      return 0
+    })
+
+    const reloadProviders = Effect.fn("Provider.reloadProviders")(function* (configInput?: ConfigV1.Info) {
+      return yield* Semaphore.withPermits(reloadSemaphore, 1)(
+        Effect.gen(function* () {
+          const cfg = configInput ?? (yield* config.get())
+          const next = yield* buildSnapshot(cfg)
+          if (Object.keys(next.providers).length === 0) {
+            return yield* new NoProvidersError()
+          }
+          const s = yield* InstanceState.get(snapshotState)
+          s.currentSnapshot = next
+          s.revision++
+          return next
         }),
-        Effect.catch(() => Effect.succeed([] as { providerID: ProviderV2.ID; modelID: ModelV2.ID }[])),
       )
-      for (const entry of recent) {
-        const provider = s.providers[entry.providerID]
-        if (!provider) continue
-        if (!provider.models[entry.modelID]) continue
-        return { providerID: entry.providerID, modelID: entry.modelID }
-      }
-
-      const configured = Object.keys(cfg.provider ?? {})
-      const provider = Object.values(s.providers).find((p) => configured.length === 0 || configured.includes(p.id))
-      if (!provider) return yield* new NoProvidersError()
-      const [model] = sort(Object.values(provider.models))
-      if (!model) return yield* new NoModelsError({ providerID: provider.id })
-      return {
-        providerID: provider.id,
-        modelID: model.id,
-      }
     })
 
-    return Service.of({ list, getProvider, getModel, getLanguage, closest, getSmallModel, defaultModel })
+    return Service.of({
+      list,
+      getProvider,
+      getModel,
+      getLanguage,
+      closest,
+      getSmallModel,
+      getSmallModelChain,
+      defaultModel,
+      forSession,
+      pinSession,
+      unpinSession,
+      cleanupOrphanedSnapshots,
+      reloadProviders,
+    })
   }),
 )
 

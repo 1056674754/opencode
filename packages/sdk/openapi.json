@@ -21260,6 +21260,10 @@
           "small_model": {
             "type": "string"
           },
+          "small_model_fallback": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
           "default_agent": {
             "type": "string"
           },

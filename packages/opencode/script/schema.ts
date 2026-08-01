@@ -58,6 +58,9 @@ function restoreModelRefs(value: unknown, key?: string): unknown {
   if ((key === "model" || key === "small_model") && schema.type === "string") {
     return { ...schema, $ref: MODEL_REF }
   }
+  if (key === "small_model_fallback" && isRecord(schema.items) && schema.items.type === "string") {
+    return { ...schema, items: { ...schema.items, $ref: MODEL_REF } }
+  }
   return schema
 }
 

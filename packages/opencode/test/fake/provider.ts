@@ -1,5 +1,6 @@
 import { Effect, Layer } from "effect"
 import { Provider } from "@/provider/provider"
+import { Config } from "@/config/config"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 
@@ -47,12 +48,21 @@ export namespace ProviderTest {
   export function fake(override: Partial<Provider.Interface> & { model?: Provider.Model; info?: Provider.Info } = {}) {
     const mdl = override.model ?? model()
     const row = override.info ?? info({}, mdl)
+    const snapshot: Provider.ProviderSnapshot = {
+      models: new Map(),
+      providers: { [row.id]: row },
+      catalog: { [row.id]: row },
+      sdk: new Map(),
+      modelLoaders: {},
+      varsLoaders: {},
+    }
     return {
       model: mdl,
       info: row,
       layer: Layer.succeed(
         Provider.Service,
         Provider.Service.of({
+          forSession: Effect.fn("TestProvider.forSession")(() => Effect.succeed(snapshot)),
           list: Effect.fn("TestProvider.list")(() => Effect.succeed({ [row.id]: row })),
           getProvider: Effect.fn("TestProvider.getProvider")((providerID) => {
             if (providerID === row.id) return Effect.succeed(row)
@@ -71,9 +81,16 @@ export namespace ProviderTest {
           getSmallModel: Effect.fn("TestProvider.getSmallModel")((providerID) =>
             Effect.succeed(providerID === row.id ? mdl : undefined),
           ),
+          getSmallModelChain: Effect.fn("TestProvider.getSmallModelChain")((providerID) =>
+            Effect.succeed(providerID === row.id ? [mdl] : []),
+          ),
           defaultModel: Effect.fn("TestProvider.defaultModel")(() =>
             Effect.succeed({ providerID: row.id, modelID: mdl.id }),
           ),
+          pinSession: Effect.fn("TestProvider.pinSession")(() => Effect.succeed(snapshot)),
+          unpinSession: Effect.fn("TestProvider.unpinSession")(() => Effect.void),
+          cleanupOrphanedSnapshots: Effect.fn("TestProvider.cleanupOrphanedSnapshots")(() => Effect.succeed(0)),
+          reloadProviders: Effect.fn("TestProvider.reloadProviders")(() => Effect.succeed(snapshot)),
           ...override,
         }),
       ),

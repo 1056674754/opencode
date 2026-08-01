@@ -827,6 +827,40 @@ it.instance(
   { config: { small_model: "anthropic/not-a-real-model" } },
 )
 
+it.instance(
+  "getSmallModelChain returns primary plus configured fallbacks in order",
+  Effect.gen(function* () {
+    yield* set("ANTHROPIC_API_KEY", "test-api-key")
+    const models = yield* Provider.use.getSmallModelChain(ProviderV2.ID.anthropic)
+    expect(models.length).toBe(2)
+    expect(String(models[0]!.id)).toBe("claude-sonnet-4-6")
+    expect(String(models[1]!.id)).toBe("claude-sonnet-4-6")
+  }),
+  { config: { small_model: "anthropic/claude-sonnet-4-6", small_model_fallback: ["anthropic/claude-sonnet-4-6"] } },
+)
+
+it.instance(
+  "getSmallModelChain skips unresolvable fallback entries",
+  Effect.gen(function* () {
+    yield* set("ANTHROPIC_API_KEY", "test-api-key")
+    const models = yield* Provider.use.getSmallModelChain(ProviderV2.ID.anthropic)
+    expect(models.length).toBe(1)
+    expect(String(models[0]!.id)).toBe("claude-sonnet-4-6")
+  }),
+  { config: { small_model: "anthropic/claude-sonnet-4-6", small_model_fallback: ["anthropic/not-a-real-model"] } },
+)
+
+it.instance(
+  "getSmallModelChain includes fallbacks even without small_model config",
+  Effect.gen(function* () {
+    yield* set("ANTHROPIC_API_KEY", "test-api-key")
+    const models = yield* Provider.use.getSmallModelChain(ProviderV2.ID.anthropic)
+    const hasFallback = models.some((m) => String(m.id) === "claude-sonnet-4-6")
+    expect(hasFallback).toBe(true)
+  }),
+  { config: { small_model_fallback: ["anthropic/claude-sonnet-4-6"] } },
+)
+
 test("provider.sort prioritizes preferred models", () => {
   const models = [
     { id: "random-model", name: "Random" },

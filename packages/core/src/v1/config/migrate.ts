@@ -18,6 +18,7 @@ const keys = new Set([
   "disabled_providers",
   "enabled_providers",
   "small_model",
+  "small_model_fallback",
   "mode",
   "agent",
   "provider",

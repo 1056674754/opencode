@@ -1252,7 +1252,11 @@ export type Config = {
   /**
    * Small model to use for tasks like title generation in the format of provider/model
    */
-  small_model?: string
+   small_model?: string
+   /**
+    * Fallback models tried in order when small_model fails or is unavailable (e.g. quota exhausted). Each entry is provider/model format.
+    */
+   small_model_fallback?: Array<string>
   /**
    * Custom username to display in conversations instead of system username
    */

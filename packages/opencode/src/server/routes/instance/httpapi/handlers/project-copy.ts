@@ -25,37 +25,54 @@ export const projectCopyHandlers = HttpApiBuilder.group(InstanceHttpApi, "projec
     const generateName = Effect.fn("ProjectCopyHttpApi.generateName")(function* (context: string | undefined) {
       const text = context?.trim()
       if (!text) return Slug.create()
-      const fallback = yield* provider.defaultModel().pipe(Effect.catch(() => Effect.succeed(undefined)))
+      const snapshot = yield* provider.forSession()
+      const fallback = yield* provider
+        .defaultModel({ snapshot })
+        .pipe(Effect.catch(() => Effect.succeed(undefined)))
       if (!fallback) return Slug.create()
-      const model =
-        (yield* provider.getSmallModel(fallback.providerID)) ??
-        (yield* provider.getModel(fallback.providerID, fallback.modelID))
+      const chain = yield* provider.getSmallModelChain(fallback.providerID, { snapshot })
+      const candidates = [...chain, yield* provider.getModel(fallback.providerID, fallback.modelID, { snapshot })]
+      if (candidates.length === 0) return Slug.create()
       const sessionID = SessionID.descending()
-      const result = yield* llm
-        .stream({
-          agent: COPY_NAME_AGENT,
-          user: {
-            id: MessageID.ascending(),
+      let output = ""
+      for (let i = 0; i < candidates.length; i++) {
+        const model = candidates[i]!
+        const result = yield* llm
+          .stream({
+            agent: COPY_NAME_AGENT,
+            user: {
+              id: MessageID.ascending(),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: COPY_NAME_AGENT.name,
+              model: { providerID: model.providerID, modelID: model.id },
+            },
+            system: [],
+            small: true,
+            tools: {},
+            model,
             sessionID,
-            role: "user",
-            time: { created: Date.now() },
-            agent: COPY_NAME_AGENT.name,
-            model: { providerID: model.providerID, modelID: model.id },
-          },
-          system: [],
-          small: true,
-          tools: {},
-          model,
-          sessionID,
-          retries: 2,
-          messages: [{ role: "user", content: `Generate a short 2-3 word name that describes this task:\n${text}` }],
-        })
-        .pipe(
-          Stream.filter(LLMEvent.is.textDelta),
-          Stream.map((event) => event.text),
-          Stream.mkString,
-        )
-      const output = result.trim()
+            snapshot,
+            retries: 2,
+            messages: [{ role: "user", content: `Generate a short 2-3 word name that describes this task:\n${text}` }],
+          })
+          .pipe(
+            Stream.filter(LLMEvent.is.textDelta),
+            Stream.map((event) => event.text),
+            Stream.mkString,
+            Effect.catchCause(() => Effect.succeed(null)),
+          )
+        if (result !== null) {
+          output = result.trim()
+          break
+        }
+        if (i < candidates.length - 1) {
+          yield* Effect.logWarning("project copy name generation failed, trying fallback", {
+            failedModel: `${model.providerID}/${model.id}`,
+          })
+        }
+      }
       return output ? slugify(output.split(/\s+/).slice(0, 3).join(" ")) : Slug.create()
     })
 

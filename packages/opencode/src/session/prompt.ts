@@ -219,31 +219,51 @@ const layer = Layer.effect(
 
       const ag = yield* agents.get("title")
       if (!ag) return
-      const mdl = ag.model
-        ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
-        : ((yield* provider.getSmallModel(input.providerID)) ??
-          (yield* provider.getModel(input.providerID, input.modelID)))
+      const snapshot = yield* provider.forSession(input.session.id)
+      let candidates: Provider.Model[]
+      if (ag.model) {
+        candidates = [yield* provider.getModel(ag.model.providerID, ag.model.modelID, { snapshot })]
+      } else {
+        const chain = yield* provider.getSmallModelChain(input.providerID, { snapshot })
+        candidates = [...chain, yield* provider.getModel(input.providerID, input.modelID, { snapshot })]
+      }
+      if (candidates.length === 0) return
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
-        : yield* MessageV2.toModelMessagesEffect(context, mdl)
-      const text = yield* llm
-        .stream({
-          agent: ag,
-          user: firstInfo,
-          system: [],
-          small: true,
-          tools: {},
-          model: mdl,
-          sessionID: input.session.id,
-          retries: 2,
-          messages: [{ role: "user", content: "Generate a title for this conversation:\n" }, ...msgs],
-        })
-        .pipe(
-          Stream.filter(LLMEvent.is.textDelta),
-          Stream.map((e) => e.text),
-          Stream.mkString,
-          Effect.orDie,
-        )
+        : yield* MessageV2.toModelMessagesEffect(context, candidates[0]!)
+      let text: string | undefined
+      for (let i = 0; i < candidates.length; i++) {
+        const candidate = candidates[i]!
+        const result = yield* llm
+          .stream({
+            agent: ag,
+            user: firstInfo,
+            system: [],
+            small: true,
+            tools: {},
+            model: candidate,
+            sessionID: input.session.id,
+            retries: 2,
+            snapshot,
+            messages: [{ role: "user", content: "Generate a title for this conversation:\n" }, ...msgs],
+          })
+          .pipe(
+            Stream.filter(LLMEvent.is.textDelta),
+            Stream.map((e) => e.text),
+            Stream.mkString,
+            Effect.catchCause(() => Effect.succeed(null)),
+          )
+        if (result !== null) {
+          text = result
+          break
+        }
+        if (i < candidates.length - 1) {
+          yield* Effect.logWarning("title generation failed for model, trying fallback", {
+            failedModel: `${candidate.providerID}/${candidate.id}`,
+          })
+        }
+      }
+      if (!text) return
       const cleaned = text
         .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
         .split("\n")
@@ -268,7 +288,10 @@ const layer = Layer.effect(
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
       const { task: taskTool } = yield* registry.named()
-      const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
+      const snapshot = yield* provider.forSession(sessionID)
+      const taskModel = task.model
+        ? yield* getModel(task.model.providerID, task.model.modelID, sessionID, snapshot)
+        : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
         role: "assistant",
@@ -470,7 +493,8 @@ const layer = Layer.effect(
               yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
               throw error
             }
-            const model = input.model ?? agent.model ?? (yield* currentModel(input.sessionID))
+            const shellSnapshot = yield* provider.forSession(input.sessionID)
+            const model = input.model ?? agent.model ?? (yield* currentModel(input.sessionID, shellSnapshot))
             const userMsg: SessionV1.User = {
               id: input.messageID ?? MessageID.ascending(),
               sessionID: input.sessionID,
@@ -599,8 +623,11 @@ const layer = Layer.effect(
       providerID: ProviderV2.ID,
       modelID: ModelV2.ID,
       sessionID: SessionID,
+      snapshot?: Provider.ProviderSnapshot,
     ) {
-      const exit = yield* provider.getModel(providerID, modelID).pipe(Effect.exit)
+      const exit = yield* provider
+        .getModel(providerID, modelID, snapshot ? { snapshot } : {})
+        .pipe(Effect.exit)
       if (Exit.isSuccess(exit)) return exit.value
       const err = Cause.squash(exit.cause)
       if (Provider.ModelNotFoundError.isInstance(err)) {
@@ -615,7 +642,10 @@ const layer = Layer.effect(
       return yield* Effect.die(err)
     })
 
-    const currentModel = Effect.fnUntraced(function* (sessionID: SessionID) {
+    const currentModel = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      snapshot?: Provider.ProviderSnapshot,
+    ) {
       const current = yield* db
         .select({ model: SessionTable.model })
         .from(SessionTable)
@@ -633,7 +663,7 @@ const layer = Layer.effect(
         .findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
         .pipe(Effect.orDie)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
-      return yield* provider.defaultModel().pipe(Effect.orDie)
+      return yield* provider.defaultModel(snapshot ? { snapshot } : {}).pipe(Effect.orDie)
     })
 
     const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
@@ -647,12 +677,13 @@ const layer = Layer.effect(
         throw error
       }
 
-      const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+      const snapshot = yield* provider.forSession(input.sessionID)
+      const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID, snapshot))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
         !input.variant && ag.variant && same
           ? yield* provider
-              .getModel(model.providerID, model.modelID)
+              .getModel(model.providerID, model.modelID, { snapshot })
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
       const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
@@ -865,10 +896,12 @@ const layer = Layer.effect(
                     text: `Called the Read tool with the following input: ${JSON.stringify(args)}`,
                   },
                 ]
-                const exit = yield* provider.getModel(info.model.providerID, info.model.modelID).pipe(
-                  Effect.flatMap((mdl) => execRead(args, { model: mdl })),
-                  Effect.exit,
-                )
+                const exit = yield* provider
+                  .getModel(info.model.providerID, info.model.modelID, { snapshot })
+                  .pipe(
+                    Effect.flatMap((mdl) => execRead(args, { model: mdl })),
+                    Effect.exit,
+                  )
                 if (Exit.isSuccess(exit)) {
                   const result = exit.value
                   pieces.push({
@@ -1088,6 +1121,7 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        const snapshot = yield* provider.forSession(sessionID)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1142,7 +1176,7 @@ const layer = Layer.effect(
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID, snapshot)
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
@@ -1286,6 +1320,7 @@ const layer = Layer.effect(
               ],
               tools,
               model,
+              snapshot,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
 
@@ -1412,6 +1447,7 @@ const layer = Layer.effect(
       }
       template = template.trim()
 
+      const cmdSnapshot = yield* provider.forSession(input.sessionID)
       const taskModel = yield* Effect.gen(function* () {
         if (cmd.model) return Provider.parseModel(cmd.model)
         if (cmd.agent) {
@@ -1419,10 +1455,10 @@ const layer = Layer.effect(
           if (cmdAgent?.model) return cmdAgent.model
         }
         if (input.model) return Provider.parseModel(input.model)
-        return yield* currentModel(input.sessionID)
+        return yield* currentModel(input.sessionID, cmdSnapshot)
       })
 
-      yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
+      yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID, cmdSnapshot)
 
       const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!agent) {
@@ -1458,7 +1494,7 @@ const layer = Layer.effect(
       const userModel = isSubtask
         ? input.model
           ? Provider.parseModel(input.model)
-          : yield* currentModel(input.sessionID)
+          : yield* currentModel(input.sessionID, cmdSnapshot)
         : taskModel
 
       yield* plugin.trigger(

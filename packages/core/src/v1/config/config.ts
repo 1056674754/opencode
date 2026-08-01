@@ -77,6 +77,10 @@ export const Info = Schema.Struct({
   small_model: Schema.optional(Schema.String).annotate({
     description: "Small model to use for tasks like title generation in the format of provider/model",
   }),
+  small_model_fallback: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description:
+      "Fallback models tried in order when small_model fails or is unavailable (e.g. quota exhausted). Each entry is provider/model format.",
+  }),
   default_agent: Schema.optional(Schema.String).annotate({
     description:
       "Default agent to use when none is specified. Must be a primary agent. Falls back to 'build' if not set or if the specified agent is invalid.",
