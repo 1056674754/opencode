@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import type { NamedError } from "@opencode-ai/core/util/error"
+import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Effect, Schedule, Schema } from "effect"
@@ -435,6 +435,47 @@ describe("session.message-v2.fromError", () => {
     expect(result.data.isRetryable).toBe(true)
     expect(SessionRetry.retryable(result, retryProvider)).toEqual({
       message: "An error occurred while processing your request.",
+    })
+  })
+
+  test("converts overloaded stream errors wrapped in Error to retryable APIError", () => {
+    const error = new Error(
+      JSON.stringify({
+        type: "error",
+        error: {
+          type: "service_unavailable_error",
+          code: "server_is_overloaded",
+          message: "The server is overloaded. Please try again later.",
+        },
+      }),
+    )
+    const result = MessageV2.fromError(error, { providerID: ProviderV2.ID.make("openai") })
+
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.isRetryable).toBe(true)
+    expect(SessionRetry.retryable(result, retryProvider)).toEqual({
+      message: "The server is overloaded. Please try again later.",
+    })
+  })
+
+  test("preserves unknown errors wrapped in Error as UnknownError", () => {
+    const result = MessageV2.fromError(new Error("something unexpected"), {
+      providerID: ProviderV2.ID.make("openai"),
+    })
+
+    expect(NamedError.Unknown.isInstance(result)).toBe(true)
+    if (!NamedError.Unknown.isInstance(result)) throw new Error("expected UnknownError")
+    expect(result.data.message).toBe("something unexpected")
+  })
+
+  test("retries flattened OpenAI overload errors", () => {
+    const error = MessageV2.fromError(new Error("Our servers are currently overloaded. Please try again later."), {
+      providerID: ProviderV2.ID.make("openai"),
+    })
+
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({
+      message: "Our servers are currently overloaded. Please try again later.",
     })
   })
 })

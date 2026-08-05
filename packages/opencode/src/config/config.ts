@@ -130,6 +130,8 @@ export interface Interface {
   readonly invalidate: () => Effect.Effect<void>
   readonly directories: () => Effect.Effect<string[]>
   readonly waitForDependencies: () => Effect.Effect<void>
+  readonly getFresh: () => Effect.Effect<Info>
+  readonly commitFresh: () => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Config") {}
@@ -634,6 +636,16 @@ const layer = Layer.effect(
       yield* invalidateGlobal
     })
 
+    const getFresh = Effect.fn("Config.getFresh")(function* () {
+      const ctx = yield* InstanceState.context
+      return (yield* loadInstanceState(ctx).pipe(Effect.orDie)).config
+    })
+
+    const commitFresh = Effect.fn("Config.commitFresh")(function* () {
+      yield* InstanceState.invalidate(state)
+      yield* invalidateGlobal
+    })
+
     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
       const file = globalConfigFile()
       const before = (yield* readConfigFile(file)) ?? "{}"
@@ -668,6 +680,8 @@ const layer = Layer.effect(
       invalidate,
       directories,
       waitForDependencies,
+      getFresh,
+      commitFresh,
     })
   }),
 )

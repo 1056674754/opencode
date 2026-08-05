@@ -12,6 +12,8 @@ export function make(overrides: Partial<Config.Interface> = {}) {
     invalidate: () => Effect.void,
     directories: () => Effect.succeed([]),
     waitForDependencies: () => Effect.void,
+    getFresh: () => Effect.succeed({}),
+    commitFresh: () => Effect.void,
     ...overrides,
   })
 }

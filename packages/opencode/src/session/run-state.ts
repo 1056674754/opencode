@@ -7,10 +7,12 @@ import { Effect, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
+import { Provider } from "@/provider/provider"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly disposeSession: (sessionID: SessionID) => Effect.Effect<void>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -31,6 +33,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
     const status = yield* SessionStatus.Service
+    const provider = yield* Provider.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
@@ -85,6 +88,11 @@ const layer = Layer.effect(
       yield* existing.cancel
     })
 
+    const disposeSession = Effect.fn("SessionRunState.disposeSession")(function* (sessionID: SessionID) {
+      yield* cancel(sessionID)
+      yield* provider.unpinSession(sessionID).pipe(Effect.catch(() => Effect.void))
+    })
+
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -104,7 +112,7 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+    return Service.of({ assertNotBusy, cancel, disposeSession, ensureRunning, startShell })
   }),
 )
 
@@ -146,6 +154,6 @@ function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node, Provider.node] })
 
 export * as SessionRunState from "./run-state"

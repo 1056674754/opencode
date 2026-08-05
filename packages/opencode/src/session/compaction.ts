@@ -326,9 +326,12 @@ const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
+      const snapshot = yield* provider.forSession(input.sessionID)
       const model = agent.model
-        ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+        ? yield* provider.getModel(agent.model.providerID, agent.model.modelID, { snapshot }).pipe(Effect.orDie)
+        : yield* provider
+            .getModel(userMessage.model.providerID, userMessage.model.modelID, { snapshot })
+            .pipe(Effect.orDie)
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
@@ -399,6 +402,7 @@ const layer = Layer.effect(
           },
         ],
         model,
+        snapshot,
       })
 
       if (result === "compact") {
@@ -449,7 +453,7 @@ const layer = Layer.effect(
         }
 
         if (!replay) {
-          const info = yield* provider.getProvider(userMessage.model.providerID)
+          const info = yield* provider.getProvider(userMessage.model.providerID, { snapshot })
           if (
             (yield* plugin.trigger(
               "experimental.compaction.autocontinue",
@@ -457,7 +461,7 @@ const layer = Layer.effect(
                 sessionID: input.sessionID,
                 agent: userMessage.agent,
                 model: yield* provider
-                  .getModel(userMessage.model.providerID, userMessage.model.modelID)
+                  .getModel(userMessage.model.providerID, userMessage.model.modelID, { snapshot })
                   .pipe(Effect.orDie),
                 provider: {
                   source: info.source,

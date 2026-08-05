@@ -604,6 +604,66 @@ it.live("session.processor effect tests retry recognized structured json errors"
   ),
 )
 
+it.live("session.processor effect tests retry streamed OpenAI overload errors", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                type: "error",
+                error: {
+                  type: "service_unavailable_error",
+                  code: "server_is_overloaded",
+                  message: "Our servers are currently overloaded. Please try again later.",
+                },
+              },
+            ],
+          }),
+        )
+        yield* llm.text("after overload")
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry overload")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry overload" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
+        expect(parts.some((part) => part.type === "text" && part.text === "after overload")).toBe(true)
+        expect(handle.message.error).toBeUndefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests publish retry status updates", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>

@@ -45,6 +45,7 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  snapshot?: Provider.ProviderSnapshot
 }
 
 export type StreamRequest = StreamInput & {
@@ -92,11 +93,12 @@ const live: Layer.Layer<
         mode: input.agent.mode,
       })
 
+      const snapshotOpts = input.snapshot ? { snapshot: input.snapshot } : undefined
       const [language, cfg, item, info] = yield* Effect.all(
         [
-          provider.getLanguage(input.model),
+          provider.getLanguage(input.model, snapshotOpts),
           config.get(),
-          provider.getProvider(input.model.providerID),
+          provider.getProvider(input.model.providerID, snapshotOpts),
           auth.get(input.model.providerID),
         ],
         { concurrency: "unbounded" },
@@ -116,8 +118,11 @@ const live: Layer.Layer<
       // from the workflow service are executed via opencode's tool system
       // and results sent back over the WebSocket.
       const bridge = yield* EffectBridge.make()
+      let modelForStream = language
       if (language instanceof GitLabWorkflowLanguageModel) {
-        const workflowModel = language as GitLabWorkflowLanguageModel & {
+        // Clone the cached language model instance before mutating session-scoped
+        // fields, so concurrent sessions don't clobber each other's state.
+        const workflowModel = Object.assign(Object.create(Object.getPrototypeOf(language)), language) as typeof language & {
           sessionID?: string
           sessionPreapprovedTools?: string[]
           approvalHandler?: (approvalTools: { name: string; args: string }[]) => Promise<{ approved: boolean }>
@@ -203,6 +208,7 @@ const live: Layer.Layer<
             if (unsub) await bridge.promise(unsub)
           }
         })
+        modelForStream = workflowModel
       }
 
       const tracer = cfg.experimental?.openTelemetry
@@ -323,7 +329,7 @@ const live: Layer.Layer<
           maxRetries: input.retries ?? 0,
           messages: prepared.messages,
           model: wrapLanguageModel({
-            model: language,
+            model: modelForStream,
             middleware: [
               {
                 specificationVersion: "v3" as const,

@@ -1,4 +1,5 @@
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Plugin } from "../plugin"
 import { Format } from "../format"
 import { LSP } from "@/lsp/lsp"
@@ -9,6 +10,8 @@ import { InstanceState } from "@/effect/instance-state"
 import { ShareNext } from "@/share/share-next"
 import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
+import { ConfigWatcher } from "@/config/config-watcher"
+import { Provider } from "@/provider/provider"
 import { Service } from "./bootstrap-service"
 
 export { Service } from "./bootstrap-service"
@@ -21,6 +24,8 @@ const layer = Layer.effect(
     // InstanceStore imports only the lightweight tag from bootstrap-service.ts,
     // so it can depend on bootstrap without importing this implementation graph.
     const config = yield* Config.Service
+    const fs = yield* FSUtil.Service
+    const provider = yield* Provider.Service
     const format = yield* Format.Service
     const lsp = yield* LSP.Service
     const plugin = yield* Plugin.Service
@@ -28,6 +33,15 @@ const layer = Layer.effect(
     const shareNext = yield* ShareNext.Service
     const snapshot = yield* Snapshot.Service
     const vcs = yield* Vcs.Service
+    const configWatcher = yield* InstanceState.make(
+      Effect.fn("ConfigWatcher.state")((ctx) =>
+        ConfigWatcher.watchConfigFiles(ctx.directory).pipe(
+          Effect.provideService(Config.Service, config),
+          Effect.provideService(FSUtil.Service, fs),
+          Effect.provideService(Provider.Service, provider),
+        ),
+      ),
+    )
 
     const run = Effect.gen(function* () {
       const ctx = yield* InstanceState.context
@@ -36,6 +50,8 @@ const layer = Layer.effect(
       yield* config.get()
       // Plugin can mutate config so it has to be initialized before anything else.
       yield* plugin.init()
+      yield* provider.list()
+      yield* InstanceState.get(configWatcher)
       // Each service self-manages its own slow work via Effect.forkScoped against
       // its per-instance state scope. We just await materialization here.
       yield* Effect.forEach(
@@ -52,7 +68,18 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer: layer,
-  deps: [Config.node, Format.node, LSP.node, Plugin.node, Project.node, ShareNext.node, Snapshot.node, Vcs.node],
+  deps: [
+    Config.node,
+    FSUtil.node,
+    Format.node,
+    LSP.node,
+    Plugin.node,
+    Project.node,
+    Provider.node,
+    ShareNext.node,
+    Snapshot.node,
+    Vcs.node,
+  ],
 })
 
 export * as InstanceBootstrap from "./bootstrap"
