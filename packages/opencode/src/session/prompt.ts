@@ -1155,7 +1155,6 @@ const layer = Layer.effect(
             lastAssistant &&
             isTerminalFinish(lastAssistant.finish) &&
             !hasToolCalls &&
-            lastUser.id < lastAssistant.id &&
             lastAssistant.parentID === lastUser.id
           ) {
             const orphan = lastAssistantMsg?.parts.find(
