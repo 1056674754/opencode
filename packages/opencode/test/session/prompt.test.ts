@@ -1477,6 +1477,97 @@ it.instance("prompt submitted during an active run is included in the next LLM i
   }),
 )
 
+it.instance("prompt re-arms when its admitted message joins a run that returns an older assistant", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    // Given an active run whose eventual assistant was created for an older
+    // user, but has an ID newer than the prompt about to be admitted.
+    const first = yield* user(chat.id, "first")
+    const admittedID = MessageID.ascending()
+    const staleAssistant: SessionV1.Assistant = {
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: first.id,
+      sessionID: chat.id,
+      mode: "build",
+      agent: "build",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now(), completed: Date.now() },
+      finish: "stop",
+    }
+    yield* sessions.updateMessage(staleAssistant)
+    const stalePart = yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: staleAssistant.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "stale reply to first",
+    })
+    const staleResult = { info: staleAssistant, parts: [stalePart] } satisfies SessionV1.WithParts
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const occupied = yield* run
+      .ensureRunning(
+        chat.id,
+        Effect.succeed(staleResult),
+        Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(staleResult)),
+      )
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(started)
+    yield* llm.text("coverage of second")
+
+    // When the real prompt path persists the newer user while that run owns
+    // the single-flight runner, its first loop call joins the older run.
+    const submitted = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        messageID: admittedID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "second" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      sessions
+        .messages({ sessionID: chat.id })
+        .pipe(
+          Effect.map((messages) =>
+            messages.some((message) => message.info.role === "user" && message.info.id === admittedID)
+              ? true
+              : undefined,
+          ),
+      ),
+      "timed out waiting for admitted prompt to persist",
+      "5 seconds",
+    )
+    yield* Deferred.succeed(release, undefined)
+
+    // Then prompt() must re-arm execution until an assistant proves that the
+    // admitted message was part of its input snapshot.
+    const result = yield* Fiber.join(submitted)
+    yield* Fiber.join(occupied)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role !== "assistant") throw new Error("expected assistant response")
+    expect(result.info.parentID).toBe(admittedID)
+    expect(result.parts.some((part) => part.type === "text" && part.text === "coverage of second")).toBe(true)
+    expect(yield* llm.calls).toBe(1)
+    const inputs = yield* llm.inputs
+    const messages = inputs.at(-1)?.messages
+    if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+    expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+  }),
+  10_000,
+)
+
 it.instance("assertNotBusy fails with BusyError when loop running", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
