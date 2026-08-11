@@ -79,6 +79,8 @@ export interface Interface {
     agent: Agent.Info
     permission?: PermissionV1.Ruleset
   }) => Effect.Effect<Tool.Def[]>
+  /** Invalidate the per-instance tool cache so the next turn picks up fresh config. */
+  readonly reload: () => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolRegistry") {}
@@ -339,7 +341,11 @@ const layer = Layer.effect(
       return { task: s.task, read: s.read }
     })
 
-    return Service.of({ ids, all, named, tools })
+    const reload = Effect.fn("ToolRegistry.reload")(function* () {
+      yield* InstanceState.invalidate(state)
+    })
+
+    return Service.of({ ids, all, named, tools, reload })
   }),
 )
 

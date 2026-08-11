@@ -7,6 +7,9 @@ import { EffectBridge } from "@/effect/bridge"
 import { Provider } from "@/provider/provider"
 import { Config } from "./config"
 import { ConfigPaths } from "./paths"
+import { ToolRegistry } from "@/tool/registry"
+import { MCP } from "@/mcp"
+import { Skill } from "@/skill"
 
 export const watchConfigFiles = Effect.fn("ConfigWatcher.watchConfigFiles")(function* (directory?: string) {
   const config = yield* Config.Service
@@ -29,6 +32,16 @@ export const watchConfigFiles = Effect.fn("ConfigWatcher.watchConfigFiles")(func
     const freshCfg = yield* config.getFresh()
     yield* provider.reloadProviders(freshCfg)
     yield* config.commitFresh()
+    // Invalidate per-instance caches so running sessions pick up fresh config
+    // at their next turn boundary. Non-destructive: in-flight turns keep their
+    // already-resolved tools/MCP/skills.
+    const toolRegistry = yield* ToolRegistry.Service
+    const mcp = yield* MCP.Service
+    const skill = yield* Skill.Service
+    yield* Effect.all(
+      [toolRegistry.reload(), mcp.reload(), skill.reload()],
+      { concurrency: "unbounded", discard: true },
+    )
   }).pipe(Effect.catchCause((cause) => Effect.logWarning("config watcher reload failed", { cause })))
 
   const runReload = Effect.gen(function* () {

@@ -195,6 +195,8 @@ export interface Interface {
   readonly supportsOAuth: (mcpName: string) => Effect.Effect<boolean, NotFoundError>
   readonly hasStoredTokens: (mcpName: string) => Effect.Effect<boolean>
   readonly getAuthStatus: (mcpName: string) => Effect.Effect<AuthStatus>
+  /** Invalidate the per-instance MCP client cache so the next turn picks up fresh config. */
+  readonly reload: () => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/MCP") {}
@@ -969,6 +971,10 @@ const layer = Layer.effect(
       return "authenticated"
     })
 
+    const reload = Effect.fn("MCP.reload")(function* () {
+      yield* InstanceState.invalidate(state)
+    })
+
     return Service.of({
       status,
       clients,
@@ -989,6 +995,7 @@ const layer = Layer.effect(
       supportsOAuth,
       hasStoredTokens,
       getAuthStatus,
+      reload,
     })
   }),
 )
