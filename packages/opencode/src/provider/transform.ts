@@ -351,6 +351,83 @@ function normalizeMessages(
     })
   }
 
+  // GLM (ZhiPu AI) — open.bigmodel.cn coding-plan and related endpoints —
+  // is stricter than the OpenAI Chat Completions spec and rejects several
+  // common message shapes with error 1210 ("API 调用参数有误"):
+  //   • empty content on any message
+  //   • consecutive assistant turns
+  //   • reasoning parts in assistant content (input direction)
+  //   • non-standard fields on tool messages — the AI SDK spreads
+  //     `providerOptions.openaiCompatible` into a `metadata` object on
+  //     the wire, which GLM rejects even when empty
+  //   • tool_call_ids containing characters outside [a-zA-Z0-9_-]
+  // Normalize proactively before the AI SDK re-serializes the body.
+  // See: https://github.com/sst/opencode/issues/22209
+  if (
+    ["zai", "zhipuai"].some((p) => model.providerID.toLowerCase().includes(p)) ||
+    modelID.includes("glm")
+  ) {
+    const scrubId = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "") || "call0"
+
+    const cleaned = msgs.map((msg) => {
+      // Strip top-level providerOptions — the AI SDK's
+      // convertToOpenAICompatibleChatMessages spreads
+      // providerOptions.openaiCompatible onto the wire payload and
+      // GLM rejects any non-standard field.
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        const content = msg.content
+          .filter((part: any) => part.type !== "reasoning")
+          .filter((part: any) => !(part.type === "text" && part.text === ""))
+          .map((part: any) => {
+            if (part.type === "tool-call") {
+              const { providerOptions: _po, ...rest } = part
+              return { ...rest, toolCallId: scrubId(part.toolCallId), input: part.input ?? {} }
+            }
+            return part
+          })
+        const { providerOptions: _mo, ...rest } = msg
+        return { ...rest, content } as ModelMessage
+      }
+
+      if (msg.role === "tool" && Array.isArray(msg.content)) {
+        const content = msg.content.map((part: any) => {
+          if (part.type === "tool-result") {
+            const { providerOptions: _po, ...rest } = part
+            return { ...rest, toolCallId: scrubId(part.toolCallId) }
+          }
+          return part
+        })
+        const { providerOptions: _mo, ...rest } = msg
+        return { ...rest, content } as ModelMessage
+      }
+
+      const { providerOptions: _mo, ...rest } = msg as any
+      return rest
+    })
+
+    const result: ModelMessage[] = []
+    for (const msg of cleaned) {
+      const m = msg as any
+      if (m.content === "") continue
+      if (Array.isArray(m.content) && m.content.length === 0) continue
+
+      const prev = result[result.length - 1] as any
+      if (prev && prev.role === "assistant" && m.role === "assistant") {
+        const prevContent = Array.isArray(prev.content)
+          ? prev.content
+          : [{ type: "text" as const, text: String(prev.content ?? "") }]
+        const msgContent = Array.isArray(m.content)
+          ? m.content
+          : [{ type: "text" as const, text: String(m.content ?? "") }]
+        result[result.length - 1] = { ...prev, content: [...prevContent, ...msgContent] }
+      } else {
+        result.push(m)
+      }
+    }
+
+    return result
+  }
+
   return msgs
 }
 

@@ -5615,3 +5615,200 @@ describe("ProviderTransform.options - kimi family adaptive thinking", () => {
     expect(result.thinking).toBeUndefined()
   })
 })
+
+describe("ProviderTransform.message - GLM/ZhiPu normalization", () => {
+  const createModel = (providerID: string, modelID = "glm-5.2-272k") =>
+    ({
+      id: `${providerID}/${modelID}`,
+      providerID,
+      api: {
+        id: modelID,
+        url: "https://open.bigmodel.cn/api/coding/paas/v4",
+        npm: "@ai-sdk/openai-compatible",
+      },
+      name: "GLM 5.2",
+      capabilities: {
+        temperature: true,
+        reasoning: true,
+        attachment: true,
+        toolcall: true,
+        input: { text: true, audio: false, image: true, video: false, pdf: true },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: false,
+      },
+      cost: { input: 0.001, output: 0.002, cache: { read: 0.0001, write: 0.0002 } },
+      limit: { context: 272000, output: 16384 },
+      status: "active",
+      options: {},
+      headers: {},
+    }) as any
+
+  for (const providerID of ["zai", "zai-coding-plan", "zhipuai", "zhipuai-coding-plan"]) {
+    test(`${providerID}: strips providerOptions from tool messages`, () => {
+      const result = ProviderTransform.message(
+        [
+          {
+            role: "assistant",
+            content: [{ type: "tool-call", toolCallId: "call_abc", toolName: "read", input: { path: "/x" } }],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "call_abc",
+                toolName: "read",
+                output: { type: "text", value: "ok" },
+                providerOptions: { openaiCompatible: { metadata: { interrupt: true } } },
+              },
+            ],
+            providerOptions: { openaiCompatible: { someFlag: true } },
+          },
+        ] as any,
+        createModel(providerID),
+        {},
+      )
+
+      const toolMsg = result.find((m: any) => m.role === "tool") as any
+      expect(toolMsg.providerOptions).toBeUndefined()
+      const toolResult = toolMsg.content[0]
+      expect(toolResult.providerOptions).toBeUndefined()
+      expect(toolResult.toolCallId).toBe("call_abc")
+    })
+
+    test(`${providerID}: strips reasoning parts from assistant content`, () => {
+      const result = ProviderTransform.message(
+        [
+          {
+            role: "assistant",
+            content: [
+              { type: "reasoning", text: "Let me think..." },
+              { type: "text", text: "Done." },
+            ],
+          },
+        ] as any,
+        createModel(providerID),
+        {},
+      )
+      const parts = (result[0] as any).content as any[]
+      expect(parts.some((p) => p.type === "reasoning")).toBe(false)
+      expect(parts.some((p) => p.type === "text" && p.text === "Done.")).toBe(true)
+    })
+
+    test(`${providerID}: scrubs non-alphanumeric tool_call_ids`, () => {
+      const result = ProviderTransform.message(
+        [
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "call_!@#abc123", toolName: "bash", input: { cmd: "ls" } },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "call_!@#abc123",
+                toolName: "bash",
+                output: { type: "text", value: "output" },
+              },
+            ],
+          },
+        ] as any,
+        createModel(providerID),
+        {},
+      )
+      const assistantPart = (result[0] as any).content[0]
+      const toolPart = (result[1] as any).content[0]
+      expect(assistantPart.toolCallId).toBe("call_abc123")
+      expect(toolPart.toolCallId).toBe("call_abc123")
+    })
+
+    test(`${providerID}: drops empty content messages and merges consecutive assistants`, () => {
+      const result = ProviderTransform.message(
+        [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: [{ type: "text", text: "" }] },
+          { role: "assistant", content: [{ type: "text", text: "hello" }] },
+          { role: "user", content: "bye" },
+        ] as any,
+        createModel(providerID),
+        {},
+      )
+      const assistantMsgs = result.filter((m: any) => m.role === "assistant")
+      expect(assistantMsgs.length).toBe(1)
+      const parts = (assistantMsgs[0] as any).content as any[]
+      expect(parts.some((p) => p.type === "text" && p.text === "hello")).toBe(true)
+    })
+
+    test(`${providerID}: defaults tool-call input to {} when undefined`, () => {
+      const result = ProviderTransform.message(
+        [
+          {
+            role: "assistant",
+            content: [{ type: "tool-call", toolCallId: "call1", toolName: "noop" }],
+          },
+        ] as any,
+        createModel(providerID),
+        {},
+      )
+      const part = (result[0] as any).content[0]
+      expect(part.input).toEqual({})
+    })
+
+    test(`${providerID}: strips providerOptions from assistant messages`, () => {
+      const result = ProviderTransform.message(
+        [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "hi" }],
+            providerOptions: { openaiCompatible: { reasoning_content: "thought" } },
+          },
+        ] as any,
+        createModel(providerID),
+        {},
+      )
+      expect((result[0] as any).providerOptions).toBeUndefined()
+    })
+  }
+
+  test("detected via 'glm' in api.id with non-zhipuai providerID", () => {
+    const result = ProviderTransform.message(
+      [
+        {
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "thought" },
+            { type: "text", text: "reply" },
+          ],
+        },
+      ] as any,
+      createModel("custom-provider"),
+      {},
+    )
+    const parts = (result[0] as any).content as any[]
+    expect(parts.some((p) => p.type === "reasoning")).toBe(false)
+  })
+
+  test("non-GLM provider leaves reasoning parts intact", () => {
+    const model = createModel("openai")
+    model.api.id = "gpt-4o"
+    model.id = "openai/gpt-4o"
+    const result = ProviderTransform.message(
+      [
+        {
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "thought" },
+            { type: "text", text: "reply" },
+          ],
+        },
+      ] as any,
+      model,
+      {},
+    )
+    const parts = (result[0] as any).content as any[]
+    expect(parts.some((p) => p.type === "reasoning")).toBe(true)
+  })
+})
