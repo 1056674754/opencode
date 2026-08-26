@@ -1,6 +1,6 @@
 {
   "name": "@opencode-ai/function",
-  "version": "1.18.18-sscity",
+  "version": "1.18.19-sscity",
   "$schema": "https://json.schemastore.org/package.json",
   "private": true,
   "type": "module",
