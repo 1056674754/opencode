@@ -246,6 +246,50 @@ describe("opencode run (non-interactive subprocess)", () => {
     60_000,
   )
 
+  // Upstream regression coverage (#43895): a mid-run stream failure after tool
+  // output continues the prompt loop so an explicitly queued follow-up response
+  // completes the run. Unlike upstream, the fork retries output-less errored
+  // streams transparently, so the failed attempt emits a step-start but no
+  // step-finish part; the with-output unknown-finish path (which does emit a
+  // step-finish with reason "unknown") is covered by the test above.
+  cliIt.concurrent(
+    "--format json records an unknown stream finish and continuation",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.push(
+          reply().text("partial json").tool("bash", {
+            command: "printf tool",
+            description: "Print deterministic output",
+          }),
+        )
+        yield* llm.fail("provider failed")
+        yield* llm.text("recovered")
+        const result = yield* opencode.run("fail after output", { format: "json" })
+
+        const events = opencode.parseJsonEvents(result.stdout)
+        expect(result.exitCode).toBe(0)
+        expect(events.map((event) => event.type)).toEqual([
+          "step_start",
+          "text",
+          "tool_use",
+          "step_finish",
+          "step_start",
+          "step_start",
+          "text",
+          "step_finish",
+        ])
+        expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
+        expect(events[6]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered" }))
+        const unknownStepFinishes = events.filter((event) => {
+          const part = event.part as { type?: string; reason?: string } | undefined
+          return part?.type === "step-finish" && part.reason === "unknown"
+        })
+        expect(unknownStepFinishes).toEqual([])
+        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
+      }),
+    60_000,
+  )
+
   cliIt.concurrent(
     "rejects requested permissions by default and allows them with the dangerous flag",
     ({ home, llm, opencode }) =>

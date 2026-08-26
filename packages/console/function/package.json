@@ -1,6 +1,6 @@
 {
   "name": "@opencode-ai/console-function",
-  "version": "1.18.21-sscity",
+  "version": "1.18.22-sscity",
   "$schema": "https://json.schemastore.org/package.json",
   "private": true,
   "type": "module",
