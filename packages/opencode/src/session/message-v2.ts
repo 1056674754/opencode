@@ -703,6 +703,22 @@ export function fromError(
         { cause: e },
       ).toObject()
     default:
+      // Provider errors preserved from SessionProcessor's provider-error handler
+      // carry classification metadata on the Error that parseStreamError cannot
+      // recover from a plain Error wrapper.
+      {
+        const pe = e as Error & { providerClassification?: string; providerRetryable?: boolean }
+        if (pe?.providerClassification === "content-policy" || pe?.providerRetryable === true) {
+          return new APIError(
+            {
+              message: e instanceof Error ? errorMessage(e) : String(e),
+              isRetryable: true,
+              metadata: { classification: pe.providerClassification ?? "" },
+            },
+            { cause: e },
+          ).toObject()
+        }
+      }
       try {
         const parsed = ProviderError.parseStreamError(e)
         if (parsed) {

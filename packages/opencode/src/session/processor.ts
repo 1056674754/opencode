@@ -418,8 +418,15 @@ const layer = Layer.effect(
             return
           }
 
-          case "provider-error":
-            throw new Error(value.message)
+          case "provider-error": {
+            const error = new Error(value.message) as Error & {
+              providerClassification?: string
+              providerRetryable?: boolean
+            }
+            if (value.classification) error.providerClassification = value.classification
+            if (value.retryable) error.providerRetryable = value.retryable
+            throw error
+          }
 
           case "step-start":
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
@@ -625,6 +632,11 @@ const layer = Layer.effect(
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
+        // Track content-policy errors across retries so we can inject the error
+        // detail as system context for the model on the next attempt.
+        let policyContextInjected = false
+        let currentErrorDetail: string | undefined
+
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
@@ -655,13 +667,28 @@ const layer = Layer.effect(
             ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
-              (cause) => Effect.fail(Cause.squash(cause)),
+              (cause) => {
+                const squashed = Cause.squash(cause)
+                const pe = squashed as Error & { providerClassification?: string }
+                currentErrorDetail =
+                  pe?.providerClassification === "content-policy" ? errorMessage(squashed) : undefined
+                return Effect.fail(squashed)
+              },
             ),
             Effect.retry(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
                 set: (info) => {
+                  // Inject the error as system context so the model can see what
+                  // happened and rephrase. Only injected once per process call.
+                  if (currentErrorDetail && !policyContextInjected) {
+                    policyContextInjected = true
+                    streamInput.system = [
+                      ...streamInput.system,
+                      `[Previous response attempt failed: ${currentErrorDetail}]`,
+                    ]
+                  }
                   return status.set(ctx.sessionID, {
                     type: "retry",
                     attempt: info.attempt,

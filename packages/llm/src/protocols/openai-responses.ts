@@ -904,9 +904,16 @@ const providerErrorMessage = (event: OpenAIResponsesEvent, fallback: string): st
 const providerError = (event: OpenAIResponsesEvent, fallback: string) => {
   const code = event.code || event.response?.error?.code || undefined
   const message = providerErrorMessage(event, fallback)
+  const classification =
+    code === "context_length_exceeded" || isContextOverflow(message)
+      ? "context-overflow"
+      : code === "cyber_policy"
+        ? "content-policy"
+        : undefined
   return LLMEvent.providerError({
     message,
-    classification: code === "context_length_exceeded" || isContextOverflow(message) ? "context-overflow" : undefined,
+    classification,
+    retryable: classification === "content-policy" ? true : undefined,
   })
 }
 

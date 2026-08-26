@@ -13,6 +13,7 @@ export type RetryReason = "free_tier_limit" | "account_rate_limit" | (string & {
 
 export type Retryable = {
   message: string
+  maxAttempts?: number
   action?: {
     reason: RetryReason
     provider: string
@@ -78,6 +79,11 @@ export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   if (SessionV1.APIError.isInstance(error)) {
+    // Content-policy errors (e.g. cyber_policy): bounded retry so the model
+    // gets a chance to rephrase after the processor injects error context.
+    if (error.data.metadata?.classification === "content-policy") {
+      return { message: error.data.message, maxAttempts: 3 }
+    }
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
@@ -182,6 +188,9 @@ export function policy(opts: {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider)
       if (!retry) return Cause.done(meta.attempt)
+      if (retry.maxAttempts !== undefined && meta.attempt > retry.maxAttempts) {
+        return Cause.done(meta.attempt)
+      }
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis

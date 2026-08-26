@@ -388,6 +388,21 @@ describe("session.retry.retryable", () => {
       "Usage limit reached. It will reset in 15 minutes. To continue using this model now, enable usage from your available balance",
     )
   })
+
+  test("retries content-policy (cyber_policy) errors with maxAttempts cap", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "cyber_policy: This content was flagged for possible cybersecurity risk.",
+        isRetryable: true,
+        metadata: { classification: "content-policy" },
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({
+      message: "cyber_policy: This content was flagged for possible cybersecurity risk.",
+      maxAttempts: 3,
+    })
+  })
 })
 
 describe("session.message-v2.fromError", () => {
@@ -521,5 +536,54 @@ describe("session.message-v2.fromError", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({
       message: "Our servers are currently overloaded. Please try again later.",
     })
+  })
+
+  test("converts preserved provider-error with content-policy classification to retryable APIError", () => {
+    const thrown = new Error(
+      "cyber_policy: This content was flagged for possible cybersecurity risk.",
+    ) as Error & { providerClassification?: string; providerRetryable?: boolean }
+    thrown.providerClassification = "content-policy"
+    thrown.providerRetryable = true
+
+    const result = MessageV2.fromError(thrown, { providerID: ProviderV2.ID.make("openai") })
+
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.isRetryable).toBe(true)
+    expect(result.data.metadata?.classification).toBe("content-policy")
+    expect(result.data.message).toBe("cyber_policy: This content was flagged for possible cybersecurity risk.")
+  })
+
+  test("preserved provider-error with retryable flag but no classification still converts to APIError", () => {
+    const thrown = new Error("some retryable provider error") as Error & { providerRetryable?: boolean }
+    thrown.providerRetryable = true
+
+    const result = MessageV2.fromError(thrown, { providerID: ProviderV2.ID.make("openai") })
+
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.isRetryable).toBe(true)
+  })
+
+  test("content-policy error flows through fromError → retryable with maxAttempts", () => {
+    const thrown = new Error("cyber_policy: flagged for cybersecurity risk") as Error & {
+      providerClassification?: string
+    }
+    thrown.providerClassification = "content-policy"
+
+    const parsed = MessageV2.fromError(thrown, { providerID: ProviderV2.ID.make("openai") })
+
+    expect(SessionRetry.retryable(parsed, retryProvider)).toEqual({
+      message: "cyber_policy: flagged for cybersecurity risk",
+      maxAttempts: 3,
+    })
+  })
+
+  test("plain Error without provider metadata still falls through to UnknownError", () => {
+    const result = MessageV2.fromError(new Error("totally unrelated error"), {
+      providerID: ProviderV2.ID.make("openai"),
+    })
+
+    expect(NamedError.Unknown.isInstance(result)).toBe(true)
   })
 })
