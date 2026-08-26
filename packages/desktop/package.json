@@ -1,7 +1,7 @@
 {
   "name": "@opencode-ai/desktop",
   "private": true,
-  "version": "1.18.16-sscity",
+  "version": "1.18.17-sscity",
   "type": "module",
   "license": "MIT",
   "homepage": "https://opencode.ai",
