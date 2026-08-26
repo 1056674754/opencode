@@ -107,6 +107,8 @@ export function toLLMEvents(
       return Effect.succeed([LLMEvent.stepStart({ index: state.step })])
 
     case "finish-step":
+      if (event.rawFinishReason === "network_error")
+        return Effect.fail(new ProviderError.ResponseStreamError("Provider finish_reason: network_error"))
       return Effect.gen(function* () {
         const reason = finishReason(event.finishReason)
         const tokens = usage(event.usage)
