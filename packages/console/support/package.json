@@ -1,6 +1,6 @@
 {
   "name": "@opencode-ai/console-support",
-  "version": "1.18.20-sscity",
+  "version": "1.18.21-sscity",
   "type": "module",
   "license": "MIT",
   "scripts": {

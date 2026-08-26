@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "version": "1.18.20-sscity",
+  "version": "1.18.21-sscity",
   "name": "@opencode-ai/core",
   "type": "module",
   "license": "MIT",
