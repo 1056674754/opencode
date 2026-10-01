@@ -108,6 +108,12 @@ export const Plugin = define({
                 providerID: item.model.providerID,
                 ...(item.model.variant === undefined ? {} : { variant: item.model.variant }),
               }
+            if (item.fallbacks !== undefined)
+              agent.fallbacks = item.fallbacks.map((entry) => ({
+                id: entry.model,
+                providerID: entry.providerID,
+                ...(entry.variant === undefined ? {} : { variant: entry.variant }),
+              }))
             if (item.request !== undefined) {
               Object.assign(agent.request.headers, item.request.headers ?? {})
               Object.assign(agent.request.body, item.request.body ?? {})

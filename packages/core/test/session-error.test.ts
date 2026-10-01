@@ -17,11 +17,14 @@ import {
   ToolFailure,
   HttpContext,
 } from "@opencode/ai"
+import { Effect } from "effect"
 import { Permission } from "@opencode/core/permission"
-import { ID } from "@opencode/core/model"
+import { ID, Model } from "@opencode/core/model"
 import { ModelResolver } from "@opencode/core/model-resolver"
 import { Provider } from "@opencode/core/provider"
+import { SessionSchema } from "@opencode/core/session/schema"
 import { Tool } from "@opencode/schema/tool"
+import { Agent } from "@opencode/schema/agent"
 import { toSessionError } from "@opencode/core/session/to-session-error"
 import { SessionRunnerRetry } from "@opencode/core/session/runner/retry"
 
@@ -305,5 +308,47 @@ describe("toSessionError", () => {
         llm(new InvalidRequestError({ message: "retry", http: http({ "x-should-retry": "true" }) })),
       ),
     ).toBeTrue()
+  })
+})
+
+describe("session retry policy", () => {
+  test("retries content-policy failures at most three times", async () => {
+    const decide = await Effect.runPromise(SessionRunnerRetry.policy(SessionSchema.ID.make("ses_retry-cap")))
+    const cause = llm(new ContentPolicyError({ message: "cyber_policy: rejected by the safety system" }))
+    const error = toSessionError(cause)
+    const input = {
+      cause,
+      error,
+      agent: Agent.ID.make("build"),
+      model: Model.Ref.make({ providerID: Provider.ID.make("zai"), id: Model.ID.make("glm-5.3") }),
+      hook: () => Effect.void,
+      retry: true,
+    }
+    const decisions = []
+    for (let index = 0; index < 5; index++) decisions.push(await Effect.runPromise(decide(input)))
+    expect(decisions.filter((decision) => decision.retry)).toHaveLength(3)
+    expect(decisions[3]?.retry).toBe(false)
+    expect(decisions[4]?.retry).toBe(false)
+  })
+
+  test("content-policy cap resets when a different failure arrives", async () => {
+    const decide = await Effect.runPromise(SessionRunnerRetry.policy(SessionSchema.ID.make("ses_retry-reset")))
+    const policyCause = llm(new ContentPolicyError({ message: "cyber_policy: rejected" }))
+    const transportCause = llm(new TransportError({ message: "transport", transport: "http", operation: "request" }))
+    const base = {
+      error: toSessionError(policyCause),
+      agent: Agent.ID.make("build"),
+      model: Model.Ref.make({ providerID: Provider.ID.make("zai"), id: Model.ID.make("glm-5.3") }),
+      hook: () => Effect.void,
+      retry: true,
+    }
+    await Effect.runPromise(decide({ ...base, cause: policyCause }))
+    await Effect.runPromise(decide({ ...base, cause: policyCause }))
+    const afterTransport = await Effect.runPromise(
+      decide({ ...base, cause: transportCause, error: toSessionError(transportCause) }),
+    )
+    expect(afterTransport.retry).toBe(true)
+    const fourthPolicy = await Effect.runPromise(decide({ ...base, cause: policyCause }))
+    expect(fourthPolicy.retry).toBe(true)
   })
 })

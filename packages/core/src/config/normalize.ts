@@ -149,6 +149,28 @@ export function normalize(input: unknown): Result {
       model: migratedSmallModel,
       ...legacyAgents.title,
     }
+  const legacySmallModelFallback = own(input, "small_model_fallback")
+    ? decodeValue(
+        Schema.mutable(Schema.Array(Schema.String)),
+        input.small_model_fallback,
+        ["small_model_fallback"],
+        diagnostics,
+      )
+    : undefined
+  const migratedFallbacks = legacySmallModelFallback
+    ? ConfigMigrateV1.migrate({ small_model_fallback: legacySmallModelFallback }).agents?.title?.fallbacks
+    : undefined
+  if (legacySmallModelFallback && (!migratedFallbacks || migratedFallbacks.length === 0))
+    diagnostics.push({
+      kind: "unsupported",
+      path: ["small_model_fallback"],
+      message: "omitted unsupported legacy model reference",
+    })
+  if (migratedFallbacks && migratedFallbacks.length > 0)
+    legacyAgents.title = {
+      fallbacks: migratedFallbacks,
+      ...legacyAgents.title,
+    }
   const modeAgents = mapValues(decodeMap(input.mode, ConfigAgentV1.Info, ["mode"], diagnostics, decodeValue), (value) =>
     canonical(ConfigAgent.Info, ConfigMigrateV1.migrateAgent({ ...value, mode: "primary" })),
   )
@@ -161,7 +183,11 @@ export function normalize(input: unknown): Result {
     "agents",
     migratedAgents,
     nativeAgents,
-    migratedSmallModel !== undefined || isRecord(input.agent) || isRecord(input.mode) || isRecord(input.agents),
+    migratedSmallModel !== undefined ||
+      migratedFallbacks !== undefined ||
+      isRecord(input.agent) ||
+      isRecord(input.mode) ||
+      isRecord(input.agents),
     diagnostics,
   )
 

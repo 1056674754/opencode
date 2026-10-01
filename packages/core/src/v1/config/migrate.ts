@@ -128,13 +128,19 @@ function agents(info: typeof ConfigV1.Info.Type) {
   ]
   const result = Object.fromEntries(entries.flatMap(([name, agent]) => (agent ? [[name, migrateAgent(agent)]] : [])))
   const small = modelSelection(info.small_model)
-  if (!small) return entries.length ? result : undefined
+  const fallbacks = (info.small_model_fallback ?? [])
+    .map((entry) => modelSelection(entry))
+    .filter((selection) => selection !== undefined)
+  if (!small && fallbacks.length === 0) return entries.length ? result : undefined
   return {
     ...result,
-    title: {
-      model: small,
-      ...result.title,
-    },
+    ...((small || fallbacks.length > 0) && {
+      title: {
+        model: small,
+        fallbacks: fallbacks.length > 0 ? fallbacks : undefined,
+        ...result.title,
+      },
+    }),
   }
 }
 

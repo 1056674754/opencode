@@ -13,6 +13,15 @@ import { SessionSchema } from "../schema.js"
 
 export { isRetryable }
 
+/**
+ * Content-policy rejections (e.g. GLM `cyber_policy`) can clear when the model
+ * redraws a sample, so the runner proposes retries for them a bounded number of
+ * times even though the classifier marks the class non-retryable.
+ */
+export const isSoftRetryable = (error: AIError) => error.reason._tag === "ContentPolicy"
+
+const CONTENT_POLICY_RETRY_LIMIT = 3
+
 interface Input {
   readonly cause: AIError
   readonly error: SessionError.Error
@@ -59,11 +68,14 @@ export const policy = (sessionID: SessionSchema.ID) =>
   Effect.gen(function* () {
     const step = yield* Schedule.toStep(schedule)
     let attempt = 1
+    let contentPolicyAttempts = 0
     return (input: Input) =>
       Effect.gen(function* () {
+        if (input.cause.reason._tag === "ContentPolicy") contentPolicyAttempts++
+        else contentPolicyAttempts = 0
         const now = yield* Clock.currentTimeMillis
         const next = yield* step(now, input).pipe(Pull.catchDone(() => Effect.succeed(undefined)))
-        if (!next) return { retry: false as const }
+        if (!next || contentPolicyAttempts > CONTENT_POLICY_RETRY_LIMIT) return { retry: false as const }
         const [, duration] = next
         attempt++
         const delay = Math.ceil(Duration.toMillis(duration))

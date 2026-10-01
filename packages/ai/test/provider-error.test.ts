@@ -462,4 +462,14 @@ describe("provider error messages", () => {
       ].map(providerErrorMessage),
     ).toEqual([undefined, undefined, undefined, undefined])
   })
+
+  test("classifies GLM cyber_policy rejections as content policy", () => {
+    expect(
+      classifyProviderFailure({
+        message: "cyber_policy: your request has been rejected by the safety system",
+        rawBody: '{"error":{"code":"cyber_policy","message":"your request has been rejected by the safety system"}}',
+        status: 400,
+      }),
+    ).toMatchObject({ _tag: "ContentPolicy" })
+  })
 })

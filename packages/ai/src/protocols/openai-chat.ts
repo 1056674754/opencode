@@ -575,6 +575,16 @@ const lowerMessages = Effect.fn("OpenAIChat.lowerMessages")(function* (request: 
       modelID.includes("deepseek"))
   const reasoningField = request.model.compatibility?.reasoningField
   const mistral = ["mistral", "devstral", "codestral", "pixtral", "mixtral"].some((family) => modelID.includes(family))
+  const baseURL = request.model.route.endpoint.baseURL?.toLowerCase()
+  const zaiGlm =
+    ["zai", "zai-coding-plan", "zhipuai", "zhipuai-coding-plan"].includes(request.model.provider.toLowerCase()) ||
+    baseURL?.includes("api.z.ai") === true ||
+    baseURL?.includes("open.bigmodel.cn") === true ||
+    modelID.includes("glm")
+  // GLM 4.6+ and 5.x accept replayed reasoning and tool streaming; older
+  // coding-plan endpoints reject reasoning replay with error 1210
+  // (https://github.com/sst/opencode/issues/22209).
+  const zaiGlmLegacy = zaiGlm && !/^glm-(?:4\.[67]|5(?:[.-]|$))/i.test(request.model.id)
   const lowering = {
     ...options,
     providerMetadataKey: request.model.route.providerMetadataKey ?? String(request.model.provider),
@@ -584,6 +594,7 @@ const lowerMessages = Effect.fn("OpenAIChat.lowerMessages")(function* (request: 
           .replace(/[^a-zA-Z0-9]/g, "")
           .slice(0, 9)
           .padEnd(9, "0")
+      if (zaiGlm) return id.replace(/[^a-zA-Z0-9_-]/g, "") || "call0"
       if (modelID.includes("claude")) return id.replace(/[^a-zA-Z0-9_-]/g, "_")
       if (request.model.provider === "openai" || request.model.provider === "azure" || modelID.startsWith("openai/"))
         return id.slice(0, 40)
@@ -661,7 +672,42 @@ const lowerMessages = Effect.fn("OpenAIChat.lowerMessages")(function* (request: 
     messages.push(...(yield* lowerMessage(message, reasoningField, requireReasoning, lowering)))
   }
   flushAttachments()
-  return messages
+  if (!zaiGlmLegacy) return messages
+  // Legacy GLM (ZhiPu AI) — pre-4.6 open.bigmodel.cn coding-plan and related
+  // endpoints — is stricter than the OpenAI Chat Completions spec and rejects
+  // several lowered message shapes with error 1210 ("API 调用参数有误"):
+  //   • empty content on any message
+  //   • consecutive assistant turns
+  //   • replayed reasoning fields on assistant messages
+  // (tool_call_ids are already sanitized through lowering.toolCallID for all
+  // zai/glm models.)
+  // See: https://github.com/sst/opencode/issues/22209
+  const scrubbed: OpenAIChatMessage[] = []
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      const { reasoning_content: _rc, reasoning: _r, reasoning_text: _rt, reasoning_details: _rd, ...wire } = message
+      if ((wire.content === null || wire.content === "") && wire.tool_calls === undefined) continue
+      const previous = scrubbed.at(-1)
+      if (previous?.role === "assistant") {
+        const toParts = (content: typeof wire.content): ReadonlyArray<OpenAIChatTextContent> => {
+          if (typeof content === "string") return content === "" ? [] : [{ type: "text", text: content }]
+          return content ?? []
+        }
+        const toolCalls = [...(previous.tool_calls ?? []), ...(wire.tool_calls ?? [])]
+        scrubbed[scrubbed.length - 1] = {
+          ...previous,
+          content: [...toParts(previous.content), ...toParts(wire.content)],
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        }
+        continue
+      }
+      scrubbed.push(wire)
+      continue
+    }
+    if (message.role !== "tool" && typeof message.content === "string" && message.content === "") continue
+    scrubbed.push(message)
+  }
+  return scrubbed
 })
 
 // Anthropic via LiteLLM and Amazon Bedrock require `tools` to be present

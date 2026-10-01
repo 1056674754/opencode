@@ -126,11 +126,19 @@ export const layer = Layer.effect(
         : firstUser.text
       const selection = yield* context.selectTitle(session)
       if (!selection) return
-      const title =
-        (yield* attempt({ session, agent: selection.agent, text, model: selection.selected })) ??
-        (selection.primary && !isDeepStrictEqual(selection.selected.ref, selection.primary.ref)
-          ? yield* attempt({ session, agent: selection.agent, text, model: selection.primary })
-          : undefined)
+      // Title generation is best-effort: walk selected -> configured fallbacks -> session model,
+      // stopping at the first candidate that produces a title.
+      const candidates: SessionRunnerModel.Resolved[] = [selection.selected]
+      for (const fallback of selection.fallbacks) {
+        if (!candidates.some((candidate) => isDeepStrictEqual(candidate.ref, fallback.ref))) candidates.push(fallback)
+      }
+      if (selection.primary && !candidates.some((candidate) => isDeepStrictEqual(candidate.ref, selection.primary!.ref)))
+        candidates.push(selection.primary)
+      let title: string | undefined
+      for (const candidate of candidates) {
+        title = yield* attempt({ session, agent: selection.agent, text, model: candidate })
+        if (title) break
+      }
       if (!title) return
       const expectedSequence = (yield* Bus.latestSequence(db, sessionID)) + 1
       const current = yield* store.get(sessionID)

@@ -143,6 +143,10 @@ const CONTENT_POLICY_CODES = new Set([
   "content_policy_violation",
   "image_content_policy_violation",
   "refusal",
+  // GLM (ZhiPu) reports overzealous safety rejections as `cyber_policy`; they
+  // clear when the model redraws a sample, so the session runner retries them
+  // a bounded number of times instead of failing the turn immediately.
+  "cyber_policy",
 ])
 // OpenCode Zen replaces upstream codes outside its allow-list but keeps the original
 // as a `[code]` label at the start of the rewritten message.

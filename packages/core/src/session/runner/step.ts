@@ -185,6 +185,7 @@ export const make = Effect.gen(function* () {
                   llmFailure,
                   llmError,
                   SessionRunnerRetry.isRetryable(llmFailure) ||
+                    SessionRunnerRetry.isSoftRetryable(llmFailure) ||
                     (recorded.outputStarted && isInterruptedStream(llmFailure)),
                 ),
               )

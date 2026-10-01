@@ -606,3 +606,51 @@ describe("OpenAI-compatible Chat route", () => {
     }),
   )
 })
+
+describe("GLM scrub", () => {
+  const glmModel = OpenAICompatibleChat.route
+    .with({
+      provider: "zhipu",
+      endpoint: { baseURL: "https://open.bigmodel.cn/api/paas/v4/" },
+      auth: Auth.bearer("test-key"),
+    })
+    .model({ id: "glm-5.3" })
+
+  it.effect("sanitizes tool call ids for glm-compatible routes", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model: glmModel,
+          messages: [
+            Message.user("Plan the work"),
+            Message.assistant([
+              ToolCallPart.make({ id: "call 1 weird", name: "lookup", input: { city: "Paris" } }),
+            ]),
+            Message.tool({ id: "call 1 weird", name: "lookup", result: "Sunny" }),
+          ],
+        }),
+      )
+      const assistant = prepared.body.messages[1]
+      expect(assistant?.role === "assistant" ? assistant.tool_calls?.[0]?.id : undefined).toBe("call1weird")
+      const tool = prepared.body.messages[2]
+      expect(tool?.role === "tool" ? tool.tool_call_id : undefined).toBe("call1weird")
+    }),
+  )
+
+  it.effect("leaves non-glm tool call ids untouched", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          messages: [
+            Message.user("Plan the work"),
+            Message.assistant([ToolCallPart.make({ id: "call 1", name: "lookup", input: { city: "Paris" } })]),
+            Message.tool({ id: "call 1", name: "lookup", result: "Sunny" }),
+          ],
+        }),
+      )
+      const assistant = prepared.body.messages[1]
+      expect(assistant?.role === "assistant" ? assistant.tool_calls?.[0]?.id : undefined).toBe("call 1")
+    }),
+  )
+})

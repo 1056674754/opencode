@@ -102,6 +102,8 @@ const models = Layer.mock(SessionRunnerModel.Service)({
 })
 const smallModels = Layer.mock(Model.Service, {
   small: () => Effect.succeed(selectedSmall),
+  get: (providerID: Provider.ID, id: Model.ID) =>
+    Effect.succeed(id === "title-small" ? Model.Info.default(providerID, id) : undefined),
 })
 const it = testEffect(
   AppNodeBuilder.build(
@@ -338,6 +340,36 @@ it.effect("falls back to the primary model when the small model fails", () =>
 
     expect(requests.map((request) => String(request.model.id))).toEqual(["title-small", "title-model"])
     expect(attempted.map((model) => String(model.variant))).toEqual(["low", "high"])
+    const store = yield* SessionStore.Service
+    expect((yield* store.get(sessionID))?.title).toBe("Generated Title")
+  }),
+)
+
+it.effect("uses configured title agent fallbacks when the selected model fails", () =>
+  Effect.gen(function* () {
+    titleStream = () =>
+      requests.length === 1
+        ? Stream.make(LLMEvent.providerError({ message: "Selected model unavailable" }))
+        : successfulTitle()
+
+    const agents = yield* Agent.Service
+    yield* agents.transform((editor) => {
+      editor.update(Agent.ID.make("title"), (agent) => {
+        agent.mode = "primary"
+        agent.hidden = true
+        agent.system = "You are a title generator."
+        agent.model = { providerID: Provider.ID.make("test"), id: Model.ID.make("title-missing") }
+        agent.fallbacks = [{ providerID: Provider.ID.make("test"), id: Model.ID.make("title-small") }]
+      })
+    })
+    const sessionID = Session.ID.make("ses_title_agent_fallbacks")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Use the configured fallback for this title")
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(requests.map((request) => String(request.model.id))).toEqual(["title-model", "title-small"])
     const store = yield* SessionStore.Service
     expect((yield* store.get(sessionID))?.title).toBe("Generated Title")
   }),

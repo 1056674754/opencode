@@ -1,5 +1,6 @@
 export * as SessionContext from "./context.js"
 
+import { isDeepStrictEqual } from "node:util"
 import { Model } from "../model.js"
 import { Permission } from "../permission.js"
 import { Context, Effect, Layer } from "effect"
@@ -62,6 +63,7 @@ export interface Interface {
         readonly agent: Agent.Info
         readonly primary: SessionRunnerModel.Resolved | undefined
         readonly selected: SessionRunnerModel.Resolved
+        readonly fallbacks: ReadonlyArray<SessionRunnerModel.Resolved>
       }
     | undefined
   >
@@ -115,7 +117,23 @@ const layer = Layer.effect(
         }).pipe(Effect.orElseSucceed(() => undefined)))
       const selected = preferred ?? primary
       if (!selected) return
-      return { agent, primary, selected }
+      const fallbacks: SessionRunnerModel.Resolved[] = []
+      for (const entry of agent.fallbacks ?? []) {
+        const candidate = yield* model.get(entry.providerID, entry.id).pipe(Effect.orElseSucceed(() => undefined))
+        if (!candidate) continue
+        const candidateVariant =
+          entry.variant ?? MINIMAL_REASONING_VARIANTS.find((id) => candidate.variants.some((item) => item.id === id))
+        const resolved = yield* resolveModel({
+          ...session,
+          model: Model.Ref.make({
+            providerID: candidate.providerID,
+            id: candidate.id,
+            ...(candidateVariant ? { variant: candidateVariant } : {}),
+          }),
+        }).pipe(Effect.orElseSucceed(() => undefined))
+        if (resolved && !fallbacks.some((item) => isDeepStrictEqual(item.ref, resolved.ref))) fallbacks.push(resolved)
+      }
+      return { agent, primary, selected, fallbacks }
     })
 
     const select = Effect.fn("SessionContext.select")(function* (sessionID: SessionSchema.ID) {

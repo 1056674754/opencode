@@ -1,7 +1,7 @@
 import { expect } from "bun:test"
 import { ConfigProvider, Effect } from "effect"
 import { Headers } from "effect/unstable/http"
-import { Auth, LLM, LLMClient, Message, ReasoningPart, ToolDefinition } from "../../src/index.js"
+import { Auth, LLM, LLMClient, Message, ReasoningPart, ToolCallPart, ToolDefinition } from "../../src/index.js"
 import { ZAI, ZAICodingPlan } from "../../src/providers.js"
 import { compileRequest } from "../../src/route/client.js"
 import { Endpoint } from "../../src/route/endpoint.js"
@@ -330,4 +330,78 @@ it.effect("ZAI Coding Messages serializes enabled thinking without a token budge
       ),
     ),
   ),
+)
+
+it.effect("scrubs GLM-hostile message shapes for legacy zai routes", () =>
+  Effect.gen(function* () {
+    for (const model of [ZAI.chat("glm-4.5-air"), ZAICodingPlan.chat("glm-4.5-air")]) {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model,
+          messages: [
+            Message.user("Plan the work"),
+            Message.assistant([
+              { type: "reasoning", text: "hidden chain of thought" },
+              ToolCallPart.make({ id: "call 1 weird", name: "lookup", input: { city: "Paris" } }),
+            ]),
+            Message.tool({ id: "call 1 weird", name: "lookup", result: "Sunny" }),
+            Message.assistant([{ type: "text", text: "Working on it." }]),
+          ],
+        }),
+      )
+      const messages = prepared.body.messages
+      const first = messages[1]
+      expect(first?.role === "assistant" ? first.reasoning_content : undefined).toBeUndefined()
+      expect(first?.role === "assistant" ? first.reasoning_details : undefined).toBeUndefined()
+      expect(first?.role === "assistant" ? first.tool_calls?.[0]?.id : undefined).toBe("call1weird")
+      const tool = messages[2]
+      expect(tool?.role === "tool" ? tool.tool_call_id : undefined).toBe("call1weird")
+      const last = messages.at(-1)
+      expect(last?.role === "assistant" && typeof last.content === "string" ? last.content : undefined).toBe(
+        "Working on it.",
+      )
+    }
+  }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ZAI_API_KEY: "fixture" } })))),
+)
+
+it.effect("merges consecutive assistant turns for legacy zai routes", () =>
+  Effect.gen(function* () {
+    const prepared = yield* compileRequest(
+      LLM.request({
+        model: ZAI.chat("glm-4.5-air"),
+        messages: [
+          Message.user("Plan the work"),
+          Message.assistant([{ type: "text", text: "Working" }]),
+          Message.assistant([{ type: "text", text: "on it." }]),
+          Message.assistant([{ type: "reasoning", text: "forgotten" }]),
+        ],
+      }),
+    )
+    const messages = prepared.body.messages
+    expect(messages).toHaveLength(2)
+    const merged = messages[1]
+    expect(merged?.role === "assistant" ? Array.isArray(merged.content) : false).toBe(true)
+    expect(merged?.role === "assistant" ? merged.reasoning_content : undefined).toBeUndefined()
+  }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ZAI_API_KEY: "fixture" } })))),
+)
+
+it.effect("preserves replayed reasoning for modern GLM models", () =>
+  Effect.gen(function* () {
+    const prepared = yield* compileRequest(
+      LLM.request({
+        model: ZAI.chat("glm-5.3"),
+        messages: [
+          Message.user("Plan the work"),
+          Message.assistant([
+            { type: "reasoning", text: "chain of thought" },
+            ToolCallPart.make({ id: "call_1", name: "lookup", input: { city: "Paris" } }),
+          ]),
+          Message.tool({ id: "call_1", name: "lookup", result: "Sunny" }),
+        ],
+      }),
+    )
+    const assistant = prepared.body.messages[1]
+    expect(assistant?.role === "assistant" ? assistant.reasoning_content : undefined).toBe("chain of thought")
+    expect(assistant?.role === "assistant" ? assistant.tool_calls?.[0]?.id : undefined).toBe("call_1")
+  }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ZAI_API_KEY: "fixture" } })))),
 )
