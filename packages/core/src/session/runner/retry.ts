@@ -64,11 +64,18 @@ const schedule = Schedule.max([
   }),
 )
 
+// A timed-out attempt already waited minutes before failing, so the general allowance would let a
+// dead provider hold a step for most of an hour. Cap those attempts well below it.
+const MAX_TIMEOUT_RETRIES = 3
+
+const isTimeout = (error: AIError) => error.reason._tag === "Transport" && error.reason.code === "Timeout"
+
 export const policy = (sessionID: SessionSchema.ID) =>
   Effect.gen(function* () {
     const step = yield* Schedule.toStep(schedule)
     let attempt = 1
     let contentPolicyAttempts = 0
+    let timeouts = 0
     return (input: Input) =>
       Effect.gen(function* () {
         if (input.cause.reason._tag === "ContentPolicy") contentPolicyAttempts++
@@ -78,6 +85,7 @@ export const policy = (sessionID: SessionSchema.ID) =>
         if (!next || contentPolicyAttempts > CONTENT_POLICY_RETRY_LIMIT) return { retry: false as const }
         const [, duration] = next
         attempt++
+        if (isTimeout(input.cause)) timeouts++
         const delay = Math.ceil(Duration.toMillis(duration))
         const event: PluginHooks.Domains["session"]["retry"] = {
           sessionID,
@@ -85,7 +93,7 @@ export const policy = (sessionID: SessionSchema.ID) =>
           model: input.model,
           error: input.error,
           attempt,
-          decision: input.retry ? { retry: true, delay } : { retry: false },
+          decision: input.retry && timeouts <= MAX_TIMEOUT_RETRIES ? { retry: true, delay } : { retry: false },
         }
         yield* input.hook(event)
         if (!event.decision.retry) return event.decision
